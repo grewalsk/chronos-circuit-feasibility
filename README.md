@@ -68,11 +68,19 @@ disconnect (set `CHRONOS_CIRCUIT_FORCE=1` to recompute).
 | 1 — Install & imports | 0 | libraries import; versions print |
 | 2 — Load Chronos & validate tokenization | 0a | `PER‑STEP TOKENIZATION: PASS` (lag‑in‑tokens = lag‑in‑time) |
 | 3 — Hook validation | 0b | **`PLUMBING: PASS`** — hooks fire at all 4 sites; mean‑ablation bites; cross‑attn key provenance; NLL‑proxy gradient sign |
-| 4 — Stimulus generators | 0 | periodic / AR(1) / phase‑scrambled / period‑altered / trend / changepoint |
+| 4 — Stimulus generators | 0 | periodic / AR(1) / phase‑scrambled / period‑altered / **motif** / trend / changepoint |
 | 5 — Selective‑lag scan **(GATE)** | 1 | **`GREEN \| PIVOT \| AMBIGUOUS`** + lag‑tracking heatmap (Fig 2) |
 | 6 — Copying / OV leg | 2 | tracks‑lag‑and‑copies vs tracks‑lag‑only (Fig 3) |
-| 7 — Causal validation **(GATE)** | 3 | **`PHASE 3: PASS \| FAIL`** — selective ΔCRPS + path patching + EAP + ACDC (Fig 4) |
+| 7 — Causal validation **(GATE)** | 3 | **`PHASE 3: PASS \| FAIL`** — confirmatory gate on the lag‑tracking ∩ copying head (selective ΔCRPS + period‑P power collapse), nested redundancy ladder, attention‑pattern vs OV decomposition, EAP localization (Fig 4) |
 | 8 — Feasibility report | — | overall **`GO \| NO‑GO \| PIVOT`** recommendation |
+
+> **Phase 3 is built around one principle** ([PHASE3_REDESIGN.md](PHASE3_REDESIGN.md)): the causal **GO** gate
+> tests the head we identified *independently* (Phase 1 lag‑tracking ∩ Phase 2 copying) — never heads selected
+> by the same causal metric it then validates on. Because Chronos is known‑redundant (so a single head's
+> ablation can read null even if it participates), a non‑confirmatory result is **not** a project failure: the
+> **nested redundancy ladder** (`H1 ⊆ +lag‑trackers ⊆ +dec_self ⊆ +cross ⊆ all‑attention`) shows *how
+> distributed* the periodic computation is, which is itself the publishable split / attention‑degeneration
+> result. The headline causal readouts are **selective ΔCRPS** and the **collapse of period‑P forecast power**.
 
 ---
 

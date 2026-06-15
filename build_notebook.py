@@ -81,7 +81,11 @@ CONFIG = {
         "acdc_scope": "tiny",
         "crps_num_samples": 20,
         "crps_max_series": 999,        # logged cap on series/condition for Phase-3 CRPS ablation (no cap in mock)
+        "ladder_max_series": 999,      # smaller cap for the (exploratory) redundancy ladder rungs
         "staged_max": 999,             # logged cap on staged-structure exact-patch scan
+        "obs_noise": 0.05,             # observation noise on periodic/trend/changepoint (CRPS-floor control)
+        "resample_ablation": True,     # cross-check mean-ablation with resample (noising) ablation
+        "mechanism_decomp": True,      # attention-pattern vs OV patching on the confirmatory candidate
     },
     "pilot_t4": {
         "device": "cuda",
@@ -95,8 +99,13 @@ CONFIG = {
         "eap_top_edges": 75,
         "acdc_scope": "eap_region",
         "crps_num_samples": 100,
-        "crps_max_series": 48,         # logged cap: fits a free-T4 budget (base generate is the dominant cost)
+        "crps_max_series": 32,         # logged cap for the confirmatory selective-ablation test (T4 budget)
+        "ladder_max_series": 16,       # smaller cap for the (exploratory) redundancy-ladder rungs
         "staged_max": 150,             # logged cap on the staged-structure exact-patch scan
+        "obs_noise": 0.30,             # CRPS-FLOOR FIX: lift clean periodic CRPS off the floor so ablation has
+                                       # headroom; period stays clearly detectable at this SNR (amp ~1.35 vs 0.30).
+        "resample_ablation": True,     # cross-check mean-ablation with resample (noising) ablation
+        "mechanism_decomp": True,      # attention-pattern vs OV patching on the confirmatory candidate
     },
 }
 
@@ -119,12 +128,17 @@ FORCE_DOWNSTREAM = IS_MOCK
 # CHRONOS_CIRCUIT_FORCE=1 (or delete the ckpt files) to force recomputation.
 FORCE_RECOMPUTE = os.environ.get("CHRONOS_CIRCUIT_FORCE", "0") == "1"
 def ckpt_path(name): return os.path.join(CKPT_DIR, f"{name}_{MODE}.json")
-def load_ckpt(name):
+def load_ckpt(name, required_keys=()):
     p = ckpt_path(name)
     if os.path.isfile(p) and not FORCE_RECOMPUTE:
         with open(p) as f:
+            d = json.load(f)
+        # schema guard: a checkpoint from an OLDER notebook schema is a cache MISS, not returned verbatim
+        # (returning it would crash the report). All required_keys must be present.
+        if all(k in d for k in required_keys):
             print(f"[ckpt] loaded {name} from {p} (set CHRONOS_CIRCUIT_FORCE=1 to recompute)")
-            return json.load(f)
+            return d
+        print(f"[ckpt] {name} on disk has a stale schema (missing {set(required_keys) - set(d)}); recomputing.")
     return None
 
 MOCK_TAG = "  [MOCK_CPU SMOKE TEST — NOT SCIENTIFICALLY INTERPRETABLE]" if IS_MOCK else ""
@@ -411,7 +425,8 @@ class OProjHooks:
     def __init__(self, sites):
         self.sites = sites
         self.handles = []
-        self.means = {}                    # (site,li) -> (n_heads, d_kv) ; persists across reset()
+        self.means = {}                    # (site,li) -> (n_heads, d_kv) mean over reference mix ; persists
+        self.means_resample = {}           # (site,li) -> mean over the CORRUPT (period-altered) distribution
         self.reset()
         for s in sites:
             for li, d in enumerate(sites[s]):
@@ -423,6 +438,7 @@ class OProjHooks:
         self.acts = {}                     # (site,li) -> last input tensor (capture_act / grad)
         self.ablate = set()                # {(site,li,h)} -> replace with mean
         self.patch  = {}                   # (site,li,h) -> tensor (B,S,d_kv) to write in
+        self.resample = False              # if True, ablate-> replace with means_resample (noising ablation)
     def _mk(self, site, li):
         def hook(mod, args):
             x = args[0]
@@ -440,16 +456,18 @@ class OProjHooks:
                 return None
             if self.mode == "intervene":
                 xh = xh.clone()
+                src = self.means_resample if self.resample else self.means
                 for h in range(N_HEADS):
                     if (site, li, h) in self.ablate:
-                        xh[:, :, h, :] = self.means[(site, li)][h].to(x.dtype)
+                        xh[:, :, h, :] = src[(site, li)][h].to(x.dtype)
                     if (site, li, h) in self.patch:
                         xh[:, :, h, :] = self.patch[(site, li, h)].to(x.dtype)
                 return (xh.view(B, S, INNER_DIM),)
             return None
         return hook
-    def finalize_means(self):
-        for k in self._sum: self.means[k] = (self._sum[k] / self._cnt[k]).detach()
+    def finalize_means(self, into="mean"):
+        tgt = self.means_resample if into == "resample" else self.means
+        for k in self._sum: tgt[k] = (self._sum[k] / self._cnt[k]).detach()
     def remove(self):
         for h in self.handles: h.remove()
         self.handles = []
@@ -517,14 +535,14 @@ def crps(samples, y):
     return float(out / samples.shape[1])
 
 # ---------- precompute per-head means (for mean-ablation; never zero-ablation) -------------------
-def compute_means(ref_stimuli):
+def compute_means(ref_stimuli, into="mean"):
     HOOKS.reset(); HOOKS.mode = "capture_mean"
     with torch.no_grad():
         for st in ref_stimuli:
             forward_logits(teacher_forced(st["series"], st["cont"]))
-    HOOKS.finalize_means(); HOOKS.mode = "off"
-    print(f"mean activations computed over {len(ref_stimuli)} reference stimuli "
-          f"({len(HOOKS.means)} site-layers).")
+    HOOKS.finalize_means(into=into); HOOKS.mode = "off"
+    tgt = HOOKS.means_resample if into == "resample" else HOOKS.means
+    print(f"{into}-ablation activations computed over {len(ref_stimuli)} reference stimuli ({len(tgt)} site-layers).")
 
 def ablate_ctx(heads):           # heads: iterable of (site,li,h)
     HOOKS.reset(); HOOKS.mode = "intervene"; HOOKS.ablate = set(heads); HOOKS.means = HOOKS.means
@@ -565,14 +583,17 @@ def plumbing_gate():
           f"(enc {tuple(out.encoder_attentions[0].shape)}, cross {tuple(out.cross_attentions[0].shape)})")
 
     # (2) mean-ablation positive control: biggest single-head ablation >> 0, smallest ~ 0 --------
+    # Cap the sweep (the control only needs ONE large-effect and ONE ~0-effect head); a full L*H sweep is
+    # N_LAYERS*N_HEADS generate() calls = ~3.6 min on base every kernel start.
     compute_means([{"series": series, "cont": cont}, {"series": rseries, "cont": rcont}])
     base = crps(forecast_samples(series, H, CFG["crps_num_samples"]), cont.numpy())
+    pairs = [(li, h) for li in range(N_LAYERS) for h in range(N_HEADS)]
+    cap_heads = len(pairs) if IS_MOCK else 16
     effects = []
-    for li in range(N_LAYERS):
-        for h in range(N_HEADS):
-            HOOKS.reset(); HOOKS.mode = "intervene"; HOOKS.ablate = {("cross", li, h)}
-            d = crps(forecast_samples(series, H, CFG["crps_num_samples"]), cont.numpy()) - base
-            effects.append(abs(d)); HOOKS.reset()
+    for li, h in pairs[:cap_heads]:
+        HOOKS.reset(); HOOKS.mode = "intervene"; HOOKS.ablate = {("cross", li, h)}
+        d = crps(forecast_samples(series, H, CFG["crps_num_samples"]), cont.numpy()) - base
+        effects.append(abs(d)); HOOKS.reset()
     emax, emin = max(effects), min(effects)
     checks["ablation_moves_crps"] = bool(emax > 1e-3 and emax > 5 * (emin + 1e-9))
     print(f"  [2] mean-ablation positive control: max|DeltaCRPS|={emax:.4f} (>>0 = hooks bite), "
@@ -653,6 +674,10 @@ with known ground truth, under the fixed mean-scaling regime.
   so it does **not** remove the lag-P repeat structure (a sharp subtlety — see the AR(1) note).
 - **Period-altered** — same generator, **different period**: the Phase-3 *corrupt* input (the spec's
   "period-altered/aperiodic"), which genuinely changes the lag structure for path patching / EAP.
+- **Motif (induction-diagnostic)** — a sharp, **non-sinusoidal** repeated motif (spike + step). Its fine
+  structure can only be produced by **copying the exact value one period back**, not by a smooth extrapolator
+  or frequency detector — so it is the *primary* stimulus for the Phase-3 causal test. Has its own
+  period-altered corrupt (`motif_altered`).
 - **Trend-only** and **changepoint-only** — selectivity stimuli with known positions; these must *not* be
   hurt by ablating a genuine periodic head.
 
@@ -698,48 +723,69 @@ def altered_period(P, periods):
         return periods[(periods.index(P) + len(periods) // 2) % len(periods)]
     return max(2, int(round(P * 1.5)))
 
-def make_period_altered(P, seed, L, H):
+def make_period_altered(P, seed, L, H, noise=0.05):
     # same generator/seed but a different period -> destroys the original lag-P repeat structure while
     # staying on the periodic manifold. The spec's preferred Phase-3 corrupt ("period-altered/aperiodic").
     aP = altered_period(P, CFG["periods"])
-    d = make_periodic(aP, seed + 999, L, H); d["cond"] = "period_altered"; d["orig_P"] = P; return d
+    d = make_periodic(aP, seed + 999, L, H, noise=noise); d["cond"] = "period_altered"; d["orig_P"] = P; return d
 
-def make_trend(seed, L, H):
+def make_motif(P, seed, L, H, noise=0.05):
+    # INDUCTION-DIAGNOSTIC periodic stimulus: a sharp, non-sinusoidal motif of length P repeated. The fine
+    # structure (spike + step) cannot be produced by a smooth extrapolator/frequency detector — getting it
+    # right REQUIRES copying the exact value one period back. This is the stimulus the causal test leans on.
+    g = _rng(seed + 4242); motif = g.randn(P)
+    motif[g.randint(P)] += 3.0 * (1 if g.rand() > 0.5 else -1)   # a sharp spike
+    motif[P // 2:] += 1.5                                        # a step
+    motif = motif - motif.mean()
+    x = np.tile(motif, (L + H) // P + 2)[:L + H] + noise * g.randn(L + H)
+    return dict(series=torch.tensor(x[:L], dtype=DTYPE), cont=torch.tensor(x[L:], dtype=DTYPE),
+                P=P, phase=0.0, cond="motif", seed=seed, motif=motif.tolist())
+
+def make_motif_altered(P, seed, L, H, noise=0.05):
+    # period-altered motif (different P, fresh motif) -> the Phase-3 corrupt for the motif condition.
+    aP = altered_period(P, CFG["periods"])
+    d = make_motif(aP, seed + 999, L, H, noise=noise); d["cond"] = "motif_altered"; d["orig_P"] = P; return d
+
+def make_trend(seed, L, H, noise=0.05):
     g = _rng(seed + 31); slope = g.uniform(0.5, 1.5) / (L); off = g.uniform(-1, 1)
-    t = np.arange(L + H); x = slope * t + off + 0.05 * g.randn(L + H)
+    t = np.arange(L + H); x = slope * t + off + noise * g.randn(L + H)
     return dict(series=torch.tensor(x[:L], dtype=DTYPE), cont=torch.tensor(x[L:], dtype=DTYPE),
                 P=0, phase=0.0, cond="trend", seed=seed)
 
-def make_changepoint(seed, L, H):
+def make_changepoint(seed, L, H, noise=0.05):
     g = _rng(seed + 57); cp = int(L * 0.6); jump = g.uniform(2, 4) * (1 if g.rand() > 0.5 else -1)
-    x = 0.05 * g.randn(L + H); x[cp:] += jump
+    x = noise * g.randn(L + H); x[cp:] += jump
     return dict(series=torch.tensor(x[:L], dtype=DTYPE), cont=torch.tensor(x[L:], dtype=DTYPE),
                 P=0, phase=0.0, cond="changepoint", cp=cp, seed=seed)
 
 def build_stimuli():
     L, H = CFG["context_length"], CFG["prediction_length"]
     periods, nser, nseed = CFG["periods"], CFG["n_series_per_condition"], CFG["n_seeds"]
-    S = {"periodic": [], "scrambled": [], "ar1": [], "period_altered": [], "trend": [], "changepoint": []}
+    nz = CFG["obs_noise"]   # CRPS-floor control: comparable observation noise across predictable conditions
+    S = {"periodic": [], "scrambled": [], "ar1": [], "period_altered": [],
+         "motif": [], "motif_altered": [], "trend": [], "changepoint": []}
     for sd in range(nseed):
         for P in periods:
             for k in range(nser):
                 s = sd * 1000 + P * 10 + k
-                S["periodic"].append(make_periodic(P, s, L, H))           # index-aligned across these 4 lists
+                S["periodic"].append(make_periodic(P, s, L, H, noise=nz))   # index-aligned across these lists
                 S["scrambled"].append(make_scrambled(P, s, L, H))
                 S["ar1"].append(make_ar1(P, s, L, H))
-                S["period_altered"].append(make_period_altered(P, s, L, H))
+                S["period_altered"].append(make_period_altered(P, s, L, H, noise=nz))
+                S["motif"].append(make_motif(P, s, L, H, noise=nz))         # induction-diagnostic periodic
+                S["motif_altered"].append(make_motif_altered(P, s, L, H, noise=nz))
         for k in range(nser):
-            S["trend"].append(make_trend(sd * 1000 + k, L, H))
-            S["changepoint"].append(make_changepoint(sd * 1000 + k, L, H))
-    print("stimuli:", {k: len(v) for k, v in S.items()}, f"(L={L}, H={H})" + MOCK_TAG)
+            S["trend"].append(make_trend(sd * 1000 + k, L, H, noise=nz))
+            S["changepoint"].append(make_changepoint(sd * 1000 + k, L, H, noise=nz))
+    print(f"stimuli:", {k: len(v) for k, v in S.items()}, f"(L={L}, H={H}, obs_noise={nz})" + MOCK_TAG)
     return S
 
 STIM = build_stimuli()
 
 # quick visual sanity (saved to ckpt; shown inline on Colab)
 try:
-    fig, ax = plt.subplots(1, 4, figsize=(15, 2.4))
-    for a, (name, key) in zip(ax, [("periodic", "periodic"), ("scrambled", "scrambled"),
+    fig, ax = plt.subplots(1, 5, figsize=(18, 2.4))
+    for a, (name, key) in zip(ax, [("periodic", "periodic"), ("motif", "motif"), ("scrambled", "scrambled"),
                                    ("trend", "trend"), ("changepoint", "changepoint")]):
         st = STIM[key][0]; xfull = torch.cat([st["series"], st["cont"]]).numpy()
         a.plot(xfull); a.axvline(len(st["series"]), color="r", ls=":", lw=1); a.set_title(name)
@@ -1105,42 +1151,128 @@ else:
 md(r"""
 ## Section 7 — Phase 3: causal validation (THE pillar; Fig 4)
 
-**Maps to:** Phase 3 / Fig 4. **Gate output: `PHASE 3: PASS | FAIL`.**
+**Maps to:** Phase 3 / Fig 4. **Gate output: `PHASE 3: PASS | FAIL`.** This is a *redesigned* Phase 3 — see
+the rationale doc — built around one principle: **the causal gate tests the head we identified *independently*
+(lag-tracking ∩ copying), never heads selected by the same causal metric we then validate on.**
 
-1. **Selective mean-ablation** (never zero): mean-ablate the candidate set, measure **sampled ΔCRPS** on
-   **periodic vs trend-only vs changepoint-only** with **bootstrap CIs** and a **selectivity ratio**. PASS
-   requires the **periodic-side CI excludes zero** and the non-periodic side either includes zero or is
-   `selectivity_ratio_min`× smaller.
-2. **Path patching** between clean (periodic) and corrupted (**period-altered**) inputs via per-head
-   activation patching, localizing the effect to **encoder-self vs decoder-cross**. We corrupt with a
-   *period-altered* series (not phase-scramble, which preserves the lag-P autocorrelation).
-3. **EAP sweep** with the **categorical-NLL proxy** (one backward pass) ranks every head edge; we then do
-   **exact path-patch verification** of the top `eap_top_edges` (catches false positives) **and a low-EAP-rank
-   sample** (catches the AtP* false negatives that motivate exact verification), and **ACDC scoped to the
-   EAP-surfaced region only** (never the whole model).
-4. **Staged-structure test**: head→head patching asks whether upstream heads feed the selecting head
-   (estimate → aggregate → select). Reported as a proxy in this feasibility pass.
+1. **Confirmatory gate (pre-registered).** The H1 candidate = head(s) that *both* track lag (Phase 1) **and**
+   copy (Phase 2). We **mean-ablate** it (never zero) and require **two** selective effects: (a) periodic
+   **ΔCRPS** degrades and (b) the **period-P structure of the forecast collapses** — measured as the drop in
+   the forecast's **autocorrelation at lag P** (a mechanism-targeted readout that is far more robust to
+   redundancy and to the CRPS floor than global CRPS). Both must hold on the **motif** condition (the
+   induction-diagnostic stimulus) while **trend-only / changepoint-only** stay flat; bootstrap CIs throughout.
+   A **resample (noising) ablation** (replace the head with its activation statistics under a period-altered
+   input) cross-checks the mean-ablation. **GO depends on this gate alone.**
+2. **Redundancy ladder (exploratory).** Because Chronos is known-redundant, a single head's ablation can read
+   as null even if it participates (self-repair / backup heads). So we ablate a **genuinely nested** ladder of
+   strict supersets — `H1 ⊆ H1+lag-trackers ⊆ +dec_self ⊆ +cross ⊆ all-attention` (nesting asserted in code) —
+   and report the **first non-trivial rung** where the period-P structure collapses. The top rung
+   (`all_attention`) is the **trivial ceiling** (the model loses periodicity by construction) and is excluded
+   from the collapse localization. *This is the split/distributed result and adjudicates attention-degeneration.*
+3. **Mechanism decomposition (exploratory).** On the candidate, we separate **attention-pattern patching**
+   (corrupt the head's pattern, keep its values → tests *lag selection*) from **OV/value patching** (keep the
+   pattern, corrupt the values → tests *copying*), reconstructing the head's output as `Attn · Value` so the
+   two legs can be patched independently.
+4. **Localization (exploratory, never gates).** EAP (categorical-NLL proxy, one backward pass) → exact
+   verification of top edges **and** a low-rank false-negative probe → ACDC scoped to the EAP region; plus
+   encoder-self vs decoder-cross attribution mass and the staged-structure scan.
 
-Headline metric: **selective ΔCRPS** with CIs.
+**Verdict:** **GO** iff the confirmatory candidate is causally selective; otherwise the **distributed / split**
+picture stands (a strong result in its own right). We also print the **clean CRPS floor** so a null is never
+silently mistaken for "no effect" when it is really "no headroom."
 """)
 
 code(r"""
 F = torch.nn.functional
 
-def crps_condition(cond_stim, ablate_heads, H, ns, max_series=None):
-    # paired clean/ablated CRPS per series under common random numbers -> per-series DeltaCRPS
-    stim = cond_stim if (max_series is None) else cond_stim[:max_series]
-    if max_series is not None and len(cond_stim) > len(stim):
-        print(f"  [phase3] CRPS ablation capped to {len(stim)}/{len(cond_stim)} series this condition "
-              f"(CFG['crps_max_series']={max_series}; logged, not silent)")
-    deltas = []
+def period_structure(samples, P):
+    # FRACTION of the (non-DC) mean-forecast power within +/-1 FFT bin of period P. In [0,1], scale-invariant,
+    # and sensitive to BOTH shape and amplitude loss (a normalized acf@P would be amplitude-blind: halving the
+    # periodic amplitude while keeping the shape leaves acf~1). Ablation that destroys periodicity spreads
+    # power out of the P band -> this fraction drops. Robust to the CRPS floor and comparable across obs_noise.
+    if P is None or P < 2: return float("nan")
+    f = np.asarray(samples).mean(axis=0).astype(float); f = f - f.mean()
+    H = len(f)
+    if H < P + 2: return float("nan")
+    sp = np.abs(np.fft.rfft(f)) ** 2
+    tot = float(sp[1:].sum()) + 1e-12           # exclude DC
+    k = int(round(H / P))
+    if k < 1 or k >= len(sp): return float("nan")
+    return float(sp[max(1, k - 1):k + 2].sum()) / tot
+
+STRUCT_COLLAPSE_FRAC = 0.30   # a period-P power drop counts as a COLLAPSE only if it is >= 30% of the clean
+STRUCT_COLLAPSE_MIN  = 0.02   # period structure AND >= this absolute floor AND the bootstrap CI excludes 0.
+                              # (relative -> comparable across obs_noise; absolute floor -> guards fp noise.)
+
+def struct_collapsed(struct_lo, struct_mean, clean_struct):
+    if not (np.isfinite(struct_lo) and np.isfinite(struct_mean)): return False
+    thr = max(STRUCT_COLLAPSE_MIN, STRUCT_COLLAPSE_FRAC * (clean_struct if np.isfinite(clean_struct) else 0.0))
+    return (struct_lo > 0) and (struct_mean >= thr)
+
+def uniq(seq):
+    out = []
+    for x in seq:
+        if x not in out: out.append(x)
+    return out
+
+def ablation_effects(cond_stim, heads, H, ns, mode="mean", max_series=None, tag=""):
+    # paired clean/ablated forecasts -> per-series DeltaCRPS, Delta(period-structure), mean clean CRPS,
+    # mean clean period-structure. mode='mean' replaces heads with the reference-mix mean; mode='resample'
+    # replaces with the head's mean activation under the PERIOD-ALTERED distribution (corrupt-distribution
+    # mean-ablation -- a noising cross-check, not a position-preserving resample).
+    stim = cond_stim if max_series is None else cond_stim[:max_series]
+    if tag and max_series is not None and len(cond_stim) > len(stim):
+        print(f"  [phase3] {tag}: capped to {len(stim)}/{len(cond_stim)} series (logged)")
+    heads = set(heads); dcrps, dstruct, cleans, clean_structs = [], [], [], []
     for st in stim:
+        P = st["P"]
         HOOKS.reset()
-        clean = crps(forecast_samples(st["series"], H, ns), st["cont"].numpy())
-        HOOKS.reset(); HOOKS.mode = "intervene"; HOOKS.ablate = set(ablate_heads)
-        abl = crps(forecast_samples(st["series"], H, ns), st["cont"].numpy()); HOOKS.reset()
-        deltas.append(abl - clean)
-    return np.array(deltas)
+        cs = forecast_samples(st["series"], H, ns)
+        c_crps = crps(cs, st["cont"].numpy()); c_struct = period_structure(cs, P)
+        HOOKS.reset(); HOOKS.mode = "intervene"; HOOKS.ablate = heads; HOOKS.resample = (mode == "resample")
+        as_ = forecast_samples(st["series"], H, ns); HOOKS.reset()
+        a_crps = crps(as_, st["cont"].numpy()); a_struct = period_structure(as_, P)
+        dcrps.append(a_crps - c_crps); cleans.append(c_crps)
+        if P and P >= 2 and np.isfinite(c_struct) and np.isfinite(a_struct):
+            dstruct.append(c_struct - a_struct)     # positive = ablation DESTROYED period-P structure
+            clean_structs.append(c_struct)          # same series subset as dstruct (kept aligned)
+    return (np.array(dcrps), np.array(dstruct), float(np.mean(cleans)),
+            float(np.mean(clean_structs)) if clean_structs else float("nan"))
+
+def capture_head_AV(stim, site, li, h):
+    # attention weights A (q,k) and value vectors V (k, d_kv) for ONE head, under teacher forcing.
+    mod = SITES[site][li]["attn"]; store = {}
+    def vhook(m, inp, out): store["v"] = out.detach()
+    hv = mod.v.register_forward_hook(vhook)
+    HOOKS.reset()
+    with torch.no_grad():
+        o = forward_logits(teacher_forced(stim["series"], stim["cont"]), output_attentions=True)
+    hv.remove()
+    field = {"enc_self": o.encoder_attentions, "dec_self": o.decoder_attentions, "cross": o.cross_attentions}[site]
+    A = field[li][0, h].detach().float()                          # (q, k)
+    V = store["v"][0].view(-1, N_HEADS, D_KV)[:, h, :].float()    # (k, d_kv)
+    return A, V
+
+def mechanism_decompose(cand, clean_st, corr_st):
+    # separate the head's causal contribution into lag-SELECTION (attention pattern) vs COPY (OV values),
+    # reconstructing its output as (Attn @ Value) and patching each leg from the period-altered run.
+    site, li, h = cand
+    A_c, V_c = capture_head_AV(clean_st, site, li, h)
+    A_d, V_d = capture_head_AV(corr_st,  site, li, h)
+    tf_c = teacher_forced(clean_st["series"], clean_st["cont"]); base = base_nll(tf_c)
+    def patch_contrib(A, V):
+        if A.shape[1] != V.shape[0]: return float("nan")          # shape guard (lengths must align)
+        contrib = (A @ V).unsqueeze(0)                            # (1, q, d_kv) == the head's '.o' input
+        HOOKS.reset(); HOOKS.mode = "intervene"; HOOKS.patch[(site, li, h)] = contrib
+        with torch.no_grad():
+            nll = float(F.cross_entropy(forward_logits(tf_c).logits.reshape(-1, ic.vocab_size),
+                                        tf_c["label_ids"].reshape(-1)))
+        HOOKS.reset(); return nll - base
+    return dict(head=list(cand),
+                dNLL_full=patch_contrib(A_d, V_d),     # corrupt pattern + corrupt values (== activation patch)
+                dNLL_pattern=patch_contrib(A_d, V_c),  # corrupt PATTERN, clean values -> lag SELECTION leg
+                dNLL_ov=patch_contrib(A_c, V_d),       # clean pattern, corrupt VALUES -> COPY leg
+                recon_clean=patch_contrib(A_c, V_c))   # both clean -> ~0 sanity (reconstruction == real)
 
 def boot_ci(x, nboot, seed=0):
     rs = _rng(seed); x = np.asarray(x); means = [rs.choice(x, len(x), replace=True).mean() for _ in range(nboot)]
@@ -1185,43 +1317,115 @@ def exact_patch_effect(tf_c, head, a_corr_all, base):
     HOOKS.reset()
     return patched - base
 
-def run_phase3(cand_rows):
-    cached = load_ckpt("phase3")
+def selective_block(name, heads, H, ns, nb, cap, mode="mean",
+                    per_conds=("motif", "periodic"), non_conds=("trend", "changepoint")):
+    # selective ablation for ONE head set. Gate is judged on the PRIMARY periodic cond (per_conds[0]=motif);
+    # periodic-sine is a SECONDARY comparability readout. struct = period-P power fraction (see period_structure).
+    res, clean = {}, {}
+    for cond in list(per_conds) + list(non_conds):
+        dcrps, dstruct, cmean, csmean = ablation_effects(STIM[cond], heads, H, ns, mode=mode, max_series=cap,
+                                                         tag=(f"{name}/{cond}" if name == "H1_candidate" else ""))
+        cm, clo, chi = boot_ci(dcrps, nb, seed=SEED)
+        entry = dict(crps_mean=cm, crps_lo=clo, crps_hi=chi, n=int(len(dcrps)))
+        if cond in per_conds and len(dstruct) > 0:
+            sm, slo, shi = boot_ci(dstruct, nb, seed=SEED)
+            entry.update(struct_mean=sm, struct_lo=slo, struct_hi=shi, clean_struct=csmean)
+        res[cond] = entry; clean[cond] = cmean
+    prim = res[per_conds[0]]
+    nonper_max = max(abs(res[c]["crps_mean"]) for c in non_conds) + 1e-9
+    ratio = prim["crps_mean"] / nonper_max
+    crps_sig = prim["crps_lo"] > 0
+    struct_sig = struct_collapsed(prim.get("struct_lo", -1e9), prim.get("struct_mean", 0.0),
+                                  prim.get("clean_struct", float("nan")))
+    nonper_ok = all(res[c]["crps_lo"] <= 0 <= res[c]["crps_hi"] for c in non_conds)
+    nonper_sig = any(res[c]["crps_lo"] > 0 for c in non_conds)   # a non-periodic cond significantly degraded
+    # spec selectivity rule: non-periodic CI includes 0 OR periodic effect is >= selectivity_ratio_min x larger
+    passed = crps_sig and struct_sig and (nonper_ok or ratio >= CFG["selectivity_ratio_min"])
+    maybe_empty_cache()
+    return dict(name=name, heads=[list(h) for h in heads], n_heads=len(heads), mode=mode, res=res, clean=clean,
+                ratio=float(ratio), crps_sig=bool(crps_sig), struct_sig=bool(struct_sig),
+                nonper_ok=bool(nonper_ok), nonper_sig=bool(nonper_sig),
+                pass_via_ratio=bool(passed and not nonper_ok), passed=bool(passed))
+
+def substage(name, fn):
+    # per-stage Phase-3 checkpoint so a Colab disconnect resumes MID-phase (each stage is many minutes on T4).
+    p = ckpt_path(f"phase3_{name}")
+    if os.path.isfile(p) and not FORCE_RECOMPUTE:
+        print(f"  [ckpt] phase3 substage '{name}' loaded from disk")
+        with open(p) as f: return json.load(f)
+    r = fn()
+    with open(p, "w") as f: json.dump(r, f)
+    return r
+
+def run_phase3(phase1, phase2):
+    cached = load_ckpt("phase3", required_keys=("confirm_mean", "ladder", "schema"))
     if cached is not None: return cached
     ck = ckpt_path("phase3")
     H, ns, nb = CFG["prediction_length"], CFG["crps_num_samples"], CFG["n_bootstrap"]
-    cap = CFG.get("crps_max_series", 10**9)
-    heads = [(c["site"], c["layer"], c["head"]) for c in cand_rows]
-    ref = STIM["periodic"] + STIM["ar1"] + STIM["trend"] + STIM["changepoint"]   # mean over a genuine mix
-    compute_means(ref)
+    cap, lcap = CFG.get("crps_max_series", 10**9), CFG.get("ladder_max_series", 10**9)
+    compute_means(STIM["periodic"] + STIM["motif"] + STIM["ar1"] + STIM["trend"] + STIM["changepoint"], into="mean")
+    if CFG.get("resample_ablation"):
+        compute_means(STIM["period_altered"] + STIM["motif_altered"], into="resample")
 
-    # (1) selective mean-ablation ----------------------------------------------------------------
-    res = {}
-    for cond in ("periodic", "trend", "changepoint"):
-        d = crps_condition(STIM[cond], heads, H, ns, max_series=cap)
-        m, lo, hi = boot_ci(d, nb, seed=SEED)
-        res[cond] = dict(mean=m, lo=lo, hi=hi, n=len(d))
-    nonper = max(abs(res["trend"]["mean"]), abs(res["changepoint"]["mean"]), 1e-9)
-    ratio = res["periodic"]["mean"] / nonper
-    periodic_excludes_zero = (res["periodic"]["lo"] > 0)
-    nonper_ok = (res["trend"]["lo"] <= 0 <= res["trend"]["hi"]) and (res["changepoint"]["lo"] <= 0 <= res["changepoint"]["hi"])
-    selective_pass = periodic_excludes_zero and (nonper_ok or ratio >= CFG["selectivity_ratio_min"])
-    maybe_empty_cache()
+    # ---- CONFIRMATORY candidate = Phase 1 (tracks lag) AND Phase 2 (copies); pre-registered as ALL such heads
+    copier_rows = [r for r in (phase2["rows"] if phase2 else []) if r.get("copies")]
+    h1_heads = uniq([(r["site"], r["layer"], r["head"]) for r in copier_rows])
+    has_h1 = len(h1_heads) > 0
+    if not has_h1:
+        fb = sorted([r for r in (phase2["rows"] if phase2 else []) if r.get("copy_mass") is not None],
+                    key=lambda r: -(r.get("copy_mass") or 0))
+        h1_heads = uniq([(fb[0]["site"], fb[0]["layer"], fb[0]["head"])]) if fb else \
+                   uniq([(phase1["best"]["site"], phase1["best"]["layer"], phase1["best"]["head"])])
+        print("  [phase3] NOTE: no head satisfies Phase-1 AND Phase-2 -> no true H1 candidate (distributed "
+              "picture); gate forced FAIL, the numbers below are decomposition-only.")
+    cm_by_head = {(r["site"], r["layer"], r["head"]): (r.get("copy_mass") or 0.0) for r in (phase2["rows"] if phase2 else [])}
+    cand = max(h1_heads, key=lambda hh: cm_by_head.get(hh, 0.0))   # principled mechanism head = strongest copier
+    print(f"  [phase3] confirmatory H1 set ({len(h1_heads)} heads, ablated jointly): {[list(h) for h in h1_heads]}"
+          f"  | mechanism head: {list(cand)}")
 
-    # clean (periodic) vs corrupt (PERIOD-ALTERED) for path patching / EAP. Period-altered genuinely
-    # changes the lag structure (unlike phase-scramble, which preserves the lag-P autocorrelation).
-    clean_st, corr_st = STIM["periodic"][0], STIM["period_altered"][0]
-    tf_c   = teacher_forced(clean_st["series"], clean_st["cont"])
-    A_CORR = capture_all_acts(teacher_forced(corr_st["series"], corr_st["cont"]))   # corrupt acts, captured ONCE
+    # ---- CONFIRMATORY gate (mean) + resample cross-check (each a checkpoint substage) -------------
+    confirm_mean = substage("confirm_mean", lambda: selective_block("H1_candidate", h1_heads, H, ns, nb, cap, mode="mean"))
+    confirm_resample = (substage("confirm_resample",
+                                 lambda: selective_block("H1_resample", h1_heads, H, ns, nb, cap, mode="resample"))
+                        if CFG.get("resample_ablation") else None)
+    confirmatory_pass = bool(has_h1 and confirm_mean["passed"])
+    resample_agrees = bool(confirm_resample and (confirm_resample["passed"] == confirm_mean["passed"]))
+
+    # ---- NESTED / cumulative REDUNDANCY ladder (each rung a strict superset -> genuinely monotone) -----
+    trackers = uniq([(r["site"], r["layer"], r["head"]) for r in (phase1.get("candidates") or [])])
+    dec   = [("dec_self", li, h) for li in range(N_LAYERS) for h in range(N_HEADS)]
+    cross = [("cross", li, h) for li in range(N_LAYERS) for h in range(N_HEADS)]
+    allh  = [(s, li, h) for s in SITES for li in range(N_LAYERS) for h in range(N_HEADS)]
+    r1 = uniq(list(h1_heads)); r2 = uniq(r1 + trackers); r3 = uniq(r2 + dec); r4 = uniq(r3 + cross); r5 = uniq(allh)
+    rungs = [("H1", r1), ("+lag_trackers", r2), ("+dec_self", r3), ("+cross", r4), ("all_attention", r5)]
+    for a, b in zip(rungs, rungs[1:]):
+        assert set(a[1]).issubset(set(b[1])), (a[0], b[0])   # nesting guarantee
+    ladder = []
+    for nm, hs in rungs:
+        def _run(nm=nm, hs=hs):
+            dcrps, dstruct, _, csmean = ablation_effects(STIM["motif"], hs, H, ns, mode="mean", max_series=lcap, tag=f"ladder/{nm}")
+            cmn, clo, chi = boot_ci(dcrps, nb, seed=SEED)
+            smn, slo, shi = boot_ci(dstruct, nb, seed=SEED) if len(dstruct) > 0 else (float("nan"), float("nan"), float("nan"))
+            return dict(name=nm, nheads=len(hs), crps_mean=cmn, crps_lo=clo, crps_hi=chi,
+                        struct_mean=smn, struct_lo=slo, struct_hi=shi, clean_struct=csmean,
+                        ceiling=(nm == "all_attention"))
+        ladder.append(substage(f"ladder_{nm}", _run))
+    # collapse = first NON-ceiling rung with a real period-structure collapse (the trivial all-attention is excluded)
+    collapse = next((r["name"] for r in ladder
+                     if not r["ceiling"] and struct_collapsed(r["struct_lo"], r["struct_mean"], r["clean_struct"])), None)
+
+    # ---- MECHANISM decomposition on the principled candidate head (lag-selection vs copy) ---------
+    clean_motif, corr_motif = STIM["motif"][0], STIM["motif_altered"][0]
+    mech = mechanism_decompose(cand, clean_motif, corr_motif) if CFG.get("mechanism_decomp") else None
+
+    # ---- LOCALIZATION / EAP / staged (EXPLORATORY; never gates), on motif vs motif_altered --------
+    tf_c   = teacher_forced(clean_motif["series"], clean_motif["cont"])
+    A_CORR = capture_all_acts(teacher_forced(corr_motif["series"], corr_motif["cont"]))
     base   = base_nll(tf_c)
-
-    # (3) EAP sweep (one backward pass) -> rank ----------------------------------------------------
-    eap = head_nll_attr(clean_st, A_CORR)
+    eap = head_nll_attr(clean_motif, A_CORR)
     ranked = sorted(eap.items(), key=lambda kv: -abs(kv[1]))
-    topk = ranked[:CFG["eap_top_edges"]]
-    verified = [dict(head=list(k), eap=float(sc), exact_dNLL=exact_patch_effect(tf_c, k, A_CORR, base)) for k, sc in topk]
-    # false-NEGATIVE probe (the reason exact verification exists, per AtP*): exact-patch a sample of LOW-EAP
-    # heads and flag any with a large true effect that EAP under-ranked.
+    verified = [dict(head=list(k), eap=float(sc), exact_dNLL=exact_patch_effect(tf_c, k, A_CORR, base))
+                for k, sc in ranked[:CFG["eap_top_edges"]]]
     rs = _rng(SEED); low = ranked[CFG["eap_top_edges"]:]
     fn_idx = rs.choice(len(low), size=min(len(low), max(3, CFG["eap_top_edges"])), replace=False) if low else []
     fn_checked = [dict(head=list(low[i][0]), eap=float(low[i][1]),
@@ -1230,82 +1434,100 @@ def run_phase3(cand_rows):
     false_negs = [v for v in fn_checked if abs(v["exact_dNLL"]) >= big > 0]
     union = verified + fn_checked
     eap_corr = _pearson([v["eap"] for v in union], [v["exact_dNLL"] for v in union]) if len(union) >= 3 else float("nan")
-
-    # (2) localization encoder-self vs decoder-cross: EAP per-site mass (adjudicates all three loci) ---
     loc = {s: 0.0 for s in SITES}
     for (s, li, h), sc in eap.items(): loc[s] += abs(float(sc))
     dominant_site = max(loc, key=loc.get) if loc else None
-
-    # (4) ACDC scoped to the EAP region (greedy keep-if-removal-hurts) ----------------------------
     region = [tuple(v["head"]) for v in verified]
     acdc_thresh = float(np.percentile([abs(v["exact_dNLL"]) for v in verified], 50)) if verified else 0.0
     kept = [list(hk) for hk in region if abs(exact_patch_effect(tf_c, hk, A_CORR, base)) >= acdc_thresh]
-
-    # (5) staged-structure: which upstream (strictly-earlier-layer) heads feed the selecting head? ----
-    top_cand = (cand_rows[0]["site"], cand_rows[0]["layer"], cand_rows[0]["head"]); cand_set = set(heads)
-    up_pool = [(s, li, h) for s in SITES for li in range(N_LAYERS) for h in range(N_HEADS)
-               if li < top_cand[1] and (s, li, h) not in cand_set]
+    up_pool = [(s, li, h) for s in SITES for li in range(N_LAYERS) for h in range(N_HEADS) if li < cand[1]]
     smax = CFG.get("staged_max", 10**9)
-    if len(up_pool) > smax:
-        print(f"  [phase3] staged scan capped to {smax}/{len(up_pool)} upstream heads (CFG['staged_max']; logged)")
-        up_pool = up_pool[:smax]
-    upstream = [((s, li, h), abs(exact_patch_effect(tf_c, (s, li, h), A_CORR, base))) for (s, li, h) in up_pool]
-    upstream.sort(key=lambda x: -x[1])
+    if len(up_pool) > smax: up_pool = up_pool[:smax]
+    upstream = sorted([((s, li, h), abs(exact_patch_effect(tf_c, (s, li, h), A_CORR, base))) for (s, li, h) in up_pool],
+                      key=lambda x: -x[1])
     up_thresh = (np.percentile([e for _, e in upstream], CFG["null_percentile"]) if upstream else 0.0)
     stages = [list(k) for k, e in upstream if e >= up_thresh][:5]
     staged = len(stages) >= 2
     maybe_empty_cache()
 
-    out = dict(mode=MODE, mock=IS_MOCK, selective=res, selectivity_ratio=float(ratio), scaling_regime=SCALING_REGIME,
-               periodic_excludes_zero=bool(periodic_excludes_zero), nonper_includes_zero=bool(nonper_ok),
-               corrupt="period_altered", localization=loc, dominant_site=dominant_site, eap_verified=verified,
-               eap_false_neg_checked=fn_checked, eap_false_negatives=false_negs, eap_exact_corr=eap_corr,
-               acdc_kept=kept, staged_stages=stages, staged=bool(staged),
-               candidate_heads=[list(h) for h in heads], verdict=("PASS" if bool(selective_pass) else "FAIL"))
+    out = dict(mode=MODE, mock=IS_MOCK, schema="phase3_v2", scaling_regime=SCALING_REGIME, obs_noise=CFG["obs_noise"],
+               has_h1_candidate=has_h1, confirmatory_candidate=[list(h) for h in h1_heads], n_h1_heads=len(h1_heads),
+               mechanism_head=list(cand), confirm_mean=confirm_mean, confirm_resample=confirm_resample,
+               resample_agrees=resample_agrees, confirmatory_pass=confirmatory_pass,
+               clean_motif_crps=float(confirm_mean["clean"]["motif"]),
+               clean_motif_struct=float(confirm_mean["res"]["motif"].get("clean_struct", float("nan"))),
+               ladder=ladder, ladder_collapse=collapse, mechanism=mech,
+               corrupt="period_altered/motif_altered", localization=loc, dominant_site=dominant_site,
+               eap_verified=verified, eap_false_negatives=false_negs, eap_exact_corr=eap_corr,
+               acdc_kept=kept, staged=bool(staged), staged_stages=stages,
+               verdict=("PASS" if confirmatory_pass else "FAIL"))
     with open(ck, "w") as f: json.dump(out, f, indent=2)
     return out
 
 PHASE3 = None
 if RUN_DOWNSTREAM:
-    cand_rows = (PHASE2["minimal_candidate_set"] if PHASE2 else None) or PHASE1["candidates"] or [PHASE1["best"]]
-    # normalize keys (Phase2 rows carry the same site/layer/head fields)
-    cand_rows = [{"site": c["site"], "layer": c["layer"], "head": c["head"],
-                  "T": c.get("T", 0.0), "slope": c.get("slope", 0.0)} for c in cand_rows]
-    PHASE3 = run_phase3(cand_rows)
-    s = PHASE3["selective"]
-    print("\nSelective mean-ablation DeltaCRPS (mean [95% CI]):")
-    for cond in ("periodic", "trend", "changepoint"):
-        c = s[cond]; print(f"  {cond:12s} {c['mean']:+.4f}  [{c['lo']:+.4f}, {c['hi']:+.4f}]  (n={c['n']})")
-    print(f"  selectivity ratio (periodic / max non-periodic) = {PHASE3['selectivity_ratio']:.2f}  "
-          f"(need >= {CFG['selectivity_ratio_min']} or non-periodic CIs include 0)")
-    print(f"  periodic CI excludes 0: {PHASE3['periodic_excludes_zero']}   "
-          f"non-periodic CIs include 0: {PHASE3['nonper_includes_zero']}")
-    print(f"  corrupt input for patching/EAP: {PHASE3['corrupt']} (period-altered; genuinely breaks lag-P structure)")
-    print(f"  localization (EAP |attr| mass by site): "
-          f"{ {k: round(v,4) for k,v in PHASE3['localization'].items()} }  -> dominant: {PHASE3['dominant_site']}")
-    nfn = len(PHASE3["eap_false_negatives"]); ncheck = len(PHASE3["eap_false_neg_checked"])
-    print(f"  EAP vs exact corr over top-{CFG['eap_top_edges']} + {ncheck} low-rank probes: {PHASE3['eap_exact_corr']:.3f}  "
-          f"| false negatives (large exact effect, low EAP rank): {nfn}")
-    print(f"  ACDC-kept heads (scoped to EAP region): {PHASE3['acdc_kept']}")
-    print(f"  staged structure present (>=2 upstream stages): {PHASE3['staged']}  stages={PHASE3['staged_stages']}")
-    print(f"\nPHASE 3: {PHASE3['verdict']}{MOCK_TAG}")
+    PHASE3 = run_phase3(PHASE1, PHASE2)
+    cm = PHASE3["confirm_mean"]
+
+    print(f"\nFLOOR diagnostic: clean motif CRPS={PHASE3['clean_motif_crps']:.4f}  "
+          f"clean motif P-power-frac={PHASE3['clean_motif_struct']:.3f}  (obs_noise={PHASE3['obs_noise']}; >0 => headroom)")
+    if not PHASE3["has_h1_candidate"]:
+        print("  *** NO head satisfies BOTH lag-tracking AND copying -> gate forced FAIL; the numbers below are "
+              "decomposition-only (already favors the distributed/split picture). ***")
+    print(f"\n[CONFIRMATORY gate] H1 set = {PHASE3['confirmatory_candidate']} "
+          f"({PHASE3['n_h1_heads']} heads ablated jointly; set size caveats ΔCRPS magnitude)  mean-ablation")
+    print(f"  {'condition':14s} {'dCRPS [95% CI]':30s} {'dP-power [95% CI]':28s}")
+    for cond in ("motif", "periodic", "trend", "changepoint"):
+        e = cm["res"][cond]
+        tagc = " (PRIMARY/gates)" if cond == "motif" else (" (secondary)" if cond == "periodic" else "")
+        cci = f"{e['crps_mean']:+.4f}[{e['crps_lo']:+.4f},{e['crps_hi']:+.4f}]"
+        sci = (f"{e['struct_mean']:+.4f}[{e['struct_lo']:+.4f},{e['struct_hi']:+.4f}]" if "struct_mean" in e else "-")
+        print(f"  {cond:14s} {cci:30s} {sci:28s}{tagc}")
+    print(f"  GATE (motif only): CRPS degrades={cm['crps_sig']}  P-structure collapses={cm['struct_sig']}  "
+          f"non-periodic flat={cm['nonper_ok']}  ratio={cm['ratio']:.2f}  -> confirmatory PASS={PHASE3['confirmatory_pass']}")
+    if cm["pass_via_ratio"]:
+        print(f"  NOTE: pass came via the {CFG['selectivity_ratio_min']}x ratio clause while a non-periodic condition "
+              f"is significant (selectivity is RELATIVE, not absolute).")
+    if PHASE3["confirm_resample"]:
+        print(f"  resample (corrupt-distribution-mean) cross-check: passed={PHASE3['confirm_resample']['passed']}  "
+              f"agrees-with-mean={PHASE3['resample_agrees']}")
+
+    print(f"\n[REDUNDANCY ladder] (nested supersets; motif; structure = period-P power fraction)")
+    print(f"  first NON-trivial period-structure collapse @ {PHASE3['ladder_collapse']}")
+    for r in PHASE3["ladder"]:
+        flag = "  <-- collapses" if struct_collapsed(r["struct_lo"], r["struct_mean"], r["clean_struct"]) else ""
+        ceil = "  [trivial ceiling: all attention removed]" if r["ceiling"] else ""
+        print(f"  {r['name']:16s} ({r['nheads']:3d}h)  dCRPS={r['crps_mean']:+.4f}  dP-power={r['struct_mean']:+.4f}{flag}{ceil}")
+
+    if PHASE3["mechanism"]:
+        m = PHASE3["mechanism"]; leg = "lag-SELECTION (pattern)" if abs(m["dNLL_pattern"]) > abs(m["dNLL_ov"]) else "COPY (OV/values)"
+        print(f"\n[MECHANISM] head {m['head']}: full dNLL={m['dNLL_full']:+.4f}  pattern={m['dNLL_pattern']:+.4f}  "
+              f"OV={m['dNLL_ov']:+.4f}  (recon~0:{m['recon_clean']:+.4f})  -> dominant leg: {leg}")
+
+    print(f"\n[localization, exploratory] EAP |attr| by site: "
+          f"{ {k: round(v,3) for k,v in PHASE3['localization'].items()} }"
+          f"  -> dominant: {PHASE3['dominant_site']}  | EAP-exact corr={PHASE3['eap_exact_corr']:.3f}  "
+          f"false-negs={len(PHASE3['eap_false_negatives'])}  staged={PHASE3['staged']}")
+    print(f"\nPHASE 3: {PHASE3['verdict']}{MOCK_TAG}   (GO depends ONLY on the confirmatory gate)")
 
     try:
-        fig, ax = plt.subplots(1, 2, figsize=(12, 4))
-        conds = ["periodic", "trend", "changepoint"]
-        means = [PHASE3["selective"][c]["mean"] for c in conds]
-        los = [PHASE3["selective"][c]["mean"] - PHASE3["selective"][c]["lo"] for c in conds]
-        his = [PHASE3["selective"][c]["hi"] - PHASE3["selective"][c]["mean"] for c in conds]
-        ax[0].bar(conds, means, yerr=[los, his], capsize=5, color=["#c0392b", "#7f8c8d", "#7f8c8d"])
-        ax[0].axhline(0, color="k", lw=1); ax[0].set_ylabel("DeltaCRPS under ablation")
-        ax[0].set_title("Fig 4: selective ablation" + MOCK_TAG)
-        # circuit diagram (text-on-axes): candidate + dominant site + stages
-        ax[1].axis("off"); y = 0.9
-        ax[1].text(0.02, y, "Path-patched circuit sketch:", fontsize=10, weight="bold"); y -= 0.12
-        ax[1].text(0.04, y, f"candidate(s): {PHASE3['candidate_heads']}", fontsize=8); y -= 0.1
-        ax[1].text(0.04, y, f"dominant locus: {PHASE3['dominant_site']}", fontsize=8); y -= 0.1
-        ax[1].text(0.04, y, f"upstream stages -> selector: {PHASE3['staged_stages']}", fontsize=8); y -= 0.1
-        ax[1].text(0.04, y, f"ACDC-kept: {PHASE3['acdc_kept']}", fontsize=8)
+        fig, ax = plt.subplots(1, 2, figsize=(13, 4.4))
+        conds = ["motif", "periodic", "trend", "changepoint"]; xs = np.arange(len(conds))
+        cr = [cm["res"][c]["crps_mean"] for c in conds]
+        clo = [cm["res"][c]["crps_mean"] - cm["res"][c]["crps_lo"] for c in conds]
+        chi = [cm["res"][c]["crps_hi"] - cm["res"][c]["crps_mean"] for c in conds]
+        ax[0].bar(xs, cr, 0.5, yerr=[clo, chi], capsize=3, color=["#c0392b", "#e08e8e", "#7f8c8d", "#bdc3c7"])
+        ax[0].axhline(0, color="k", lw=1); ax[0].set_xticks(xs)
+        ax[0].set_xticklabels(["motif\n(gates)", "sine\n(secondary)", "trend", "changept"], fontsize=8)
+        ax[0].set_ylabel("dCRPS under H1 ablation")
+        ax[0].set_title(f"Fig 4a: confirmatory gate (PASS={PHASE3['confirmatory_pass']}, floor={PHASE3['clean_motif_crps']:.3f})" + MOCK_TAG, fontsize=9)
+        ln = [r["name"] for r in PHASE3["ladder"]]; lx = np.arange(len(ln))
+        smv = [r["struct_mean"] for r in PHASE3["ladder"]]; ceil_i = [i for i, r in enumerate(PHASE3["ladder"]) if r["ceiling"]]
+        ax[1].plot(lx, smv, "o-", color="#c0392b")
+        if ceil_i: ax[1].plot([lx[i] for i in ceil_i], [smv[i] for i in ceil_i], "x", color="gray", ms=10, label="trivial ceiling")
+        ax[1].axhline(0, color="k", lw=1); ax[1].set_xticks(lx); ax[1].set_xticklabels(ln, rotation=20, fontsize=7)
+        ax[1].set_ylabel("d period-P power (drop)"); ax[1].legend(fontsize=7)
+        ax[1].set_title(f"Fig 4b: nested redundancy ladder (collapse @ {PHASE3['ladder_collapse']})", fontsize=9)
         fig.tight_layout(); fig.savefig(os.path.join(CKPT_DIR, "phase3_causal.png"), dpi=80); plt.show(); plt.close(fig)
     except Exception as e:
         print("phase3 plot skipped:", repr(e)[:120])
@@ -1336,20 +1558,32 @@ def feasibility_report():
     else:
         print(f"Phase 2 (copying/OV):      skipped (Phase 1 not GREEN)")
     if PHASE3:
-        s = PHASE3["selective"]["periodic"]
-        print(f"Phase 3 (causal):          {PHASE3['verdict']}   selective DeltaCRPS(periodic)="
-              f"{s['mean']:+.4f} [{s['lo']:+.4f},{s['hi']:+.4f}]  ratio={PHASE3['selectivity_ratio']:.2f}  "
-              f"dominant={PHASE3['dominant_site']}  staged={PHASE3['staged']}")
+        cmm = PHASE3["confirm_mean"]["res"]["motif"]
+        h1ok = "" if PHASE3["has_h1_candidate"] else " (no head does BOTH -> distributed)"
+        print(f"Phase 3 (causal):          {PHASE3['verdict']}{h1ok}   H1={PHASE3['confirmatory_candidate']}")
+        print(f"                           confirmatory (motif): ΔCRPS={cmm['crps_mean']:+.4f}"
+              f"[{cmm['crps_lo']:+.4f},{cmm['crps_hi']:+.4f}]  "
+              f"P-structure collapse={PHASE3['confirm_mean']['struct_sig']}  pass={PHASE3['confirmatory_pass']}")
+        print(f"                           clean motif CRPS (floor)={PHASE3['clean_motif_crps']:.4f}  "
+              f"ladder collapses @ {PHASE3['ladder_collapse']}  dominant locus={PHASE3['dominant_site']}")
+        if PHASE3.get("mechanism"):
+            m = PHASE3["mechanism"]
+            leg = "lag-selection" if abs(m["dNLL_pattern"]) > abs(m["dNLL_ov"]) else "copy(OV)"
+            print(f"                           mechanism leg: {leg}  (pattern={m['dNLL_pattern']:+.3f} vs OV={m['dNLL_ov']:+.3f})")
     else:
         print(f"Phase 3 (causal):          skipped (Phase 1 not GREEN)")
 
-    # overall recommendation
+    # overall recommendation (GO depends ONLY on the confirmatory gate)
     if PHASE1["verdict"] == "PIVOT":
         rec = "PIVOT — periodicity is not a selective attention circuit; trace the change-detection circuit (Phase 1')."
     elif PHASE1["verdict"] == "GREEN" and PHASE3 and PHASE3["verdict"] == "PASS":
-        rec = "GO — candidate selective periodic-induction head is causal & selective; commit to the A100 Large run."
+        rec = "GO — the independently-identified H1 head is causal & selective; commit to the A100 Large run."
+    elif PHASE1["verdict"] == "GREEN" and PHASE3:
+        rec = (f"NO-GO as a single-head circuit — H1 candidate not causally selective; the DISTRIBUTED/SPLIT picture "
+               f"stands (period-structure collapses at '{PHASE3['ladder_collapse']}', locus {PHASE3['dominant_site']}). "
+               f"This is outcome B/split — still a strong paper (degeneration + redundancy adjudication).")
     elif PHASE1["verdict"] == "GREEN":
-        rec = "NO-GO (yet) — Phase 1 green but causal selectivity not established; tighten Phase 3 before scaling."
+        rec = "NO-GO (yet) — Phase 1 green but Phase 3 not run."
     else:
         rec = "AMBIGUOUS — add periods/series/seeds and re-decide before committing compute."
     if IS_MOCK:
