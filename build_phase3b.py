@@ -98,7 +98,7 @@ print(f"MODE={MODE}{MOCK_TAG}  periods={CONFIG['PERIODS']} seeds={CONFIG['N_SEED
 # ============================================================================
 md("## 2. Setup")
 code(r"""
-import sys, json, subprocess
+import sys, json, subprocess, gc
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # reduce CUDA fragmentation
 def _ensure(pkg, imp):
     if os.environ.get("CHRONOS_3B_SKIP_INSTALL") == "1": return
@@ -148,6 +148,9 @@ else:
     from chronos import ChronosPipeline
     PIPE = ChronosPipeline.from_pretrained(CONFIG["model_id"], device_map=DEVICE, torch_dtype=DTYPE)
     INNER = PIPE.inner_model.eval(); VOCAB = INNER.config.vocab_size
+    INNER.requires_grad_(False)                              # no grads anywhere (no autograd graph retained)
+    try: INNER.config._attn_implementation = "eager"        # matches the known-good feasibility-notebook path
+    except Exception: pass
 
 SITES = classify_attention_modules(INNER)
 for s in SITES: assert len(SITES[s]) > 0, f"no modules for {s}"
@@ -306,14 +309,16 @@ def forecast_pilot(contexts, n_samples):
     while i < len(contexts):
         chunk = [torch.tensor(np.asarray(c), dtype=DTYPE) for c in contexts[i:i + bs]]
         try:
-            fc = PIPE.predict(chunk, prediction_length=CONFIG["PRED"], num_samples=n_samples)
+            with torch.inference_mode():    # NO autograd graph can be retained (the live-memory leak)
+                fc = PIPE.predict(chunk, prediction_length=CONFIG["PRED"], num_samples=n_samples)
+            arr = fc.detach().cpu().numpy(); del fc
         except RuntimeError as e:
             if "out of memory" not in str(e).lower(): raise
-            if DEVICE == "cuda": torch.cuda.empty_cache()
+            if DEVICE == "cuda": gc.collect(); torch.cuda.empty_cache()
             if bs > 1: bs = max(1, bs // 2); print(f"  [oom] FORECAST_BATCH -> {bs}"); continue
             raise
-        outs.append(fc.detach().cpu().numpy()); i += len(chunk)
-        if DEVICE == "cuda": torch.cuda.empty_cache()
+        outs.append(arr); i += len(chunk)
+        if DEVICE == "cuda": gc.collect(); torch.cuda.empty_cache()
     return np.concatenate(outs, axis=0)    # (n_series, n_samples, PRED)
 
 def forecast_mock(contexts, n_samples):
