@@ -146,6 +146,16 @@ if IS_MOCK:
     INNER = T5ForConditionalGeneration(cfg).eval(); VOCAB = cfg.vocab_size; PIPE = None
 else:
     from chronos import ChronosPipeline
+    if DEVICE == "cuda":   # free any model/leaked tensors left by a PRIOR (e.g. crashed) run in this session
+        for _v in ("PIPE", "INNER"):
+            if _v in globals():
+                try: del globals()[_v]
+                except Exception: pass
+        gc.collect(); torch.cuda.empty_cache()
+        _free, _tot = torch.cuda.mem_get_info()
+        print(f"GPU free {_free/1e9:.1f}/{_tot/1e9:.1f} GB before load")
+        assert _free > 1.5e9, ("Only %.2f GB free — a previous run left memory resident on the GPU. "
+                               "RESTART THE RUNTIME (Runtime -> Restart session), then run again." % (_free/1e9))
     PIPE = ChronosPipeline.from_pretrained(CONFIG["model_id"], device_map=DEVICE, torch_dtype=DTYPE)
     INNER = PIPE.inner_model.eval(); VOCAB = INNER.config.vocab_size
     INNER.requires_grad_(False)                              # no grads anywhere (no autograd graph retained)
