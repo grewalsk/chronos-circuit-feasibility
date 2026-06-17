@@ -64,6 +64,7 @@ CONFIG = {
     "OBS_NOISE": 0.30,
     "N_CRPS_SAMPLES": 100,
     "N_BOOTSTRAP": 1000,
+    "FORECAST_BATCH": 4,                 # series per predict() call (T4-memory safe; auto-halves on OOM)
     "N_RANDOM_DRAWS": 8,                 # size-matched random@N (f=1) head-count baseline draws
     "CONDITIONS_3B": ["motif", "trend", "changepoint"],
     "SITES_3B": ["enc_self", "dec_self", "cross"],
@@ -79,7 +80,7 @@ CONFIG = {
     # ---- mock overrides (tiny random T5; NOT interpretable) ----
     "mock_cpu": {
         "PERIODS": [6, 8], "N_SEEDS": 2, "N_SERIES": 6, "CTX": 48, "PRED": 24,
-        "N_CRPS_SAMPLES": 12, "N_BOOTSTRAP": 50, "N_RANDOM_DRAWS": 3,
+        "N_CRPS_SAMPLES": 12, "N_BOOTSTRAP": 50, "N_RANDOM_DRAWS": 3, "FORECAST_BATCH": 999,
         "F_GRID": [0.25, 0.5, 1.0], "SWEEP_DRAWS": 2, "SWEEP_SERIES": 4, "SWEEP_SEEDS": 1,
     },
 }
@@ -98,6 +99,7 @@ print(f"MODE={MODE}{MOCK_TAG}  periods={CONFIG['PERIODS']} seeds={CONFIG['N_SEED
 md("## 2. Setup")
 code(r"""
 import sys, json, subprocess
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # reduce CUDA fragmentation
 def _ensure(pkg, imp):
     if os.environ.get("CHRONOS_3B_SKIP_INSTALL") == "1": return
     try: __import__(imp)
@@ -297,9 +299,22 @@ print(f"hooks on {len(HANDLES)} '.o' modules | pool={len(HEAD_POOL)} | N(site)={
 md("## 7. Forecast backends + plumbing assert")
 code(r"""
 def forecast_pilot(contexts, n_samples):
+    # forecast in small SERIES chunks (batching all 32 series x 100 samples through 64-step generation OOMs a
+    # T4 — the cross-attn KV cache over the full context is the driver). Auto-halve the chunk on OOM.
     torch.manual_seed(CONFIG["SEED0"])    # common random numbers (clean vs ablated share sampling noise)
-    ctx = [torch.tensor(np.asarray(c), dtype=DTYPE) for c in contexts]
-    return PIPE.predict(ctx, prediction_length=CONFIG["PRED"], num_samples=n_samples).detach().cpu().numpy()
+    bs = int(CONFIG.get("FORECAST_BATCH", 4)); outs = []; i = 0
+    while i < len(contexts):
+        chunk = [torch.tensor(np.asarray(c), dtype=DTYPE) for c in contexts[i:i + bs]]
+        try:
+            fc = PIPE.predict(chunk, prediction_length=CONFIG["PRED"], num_samples=n_samples)
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower(): raise
+            if DEVICE == "cuda": torch.cuda.empty_cache()
+            if bs > 1: bs = max(1, bs // 2); print(f"  [oom] FORECAST_BATCH -> {bs}"); continue
+            raise
+        outs.append(fc.detach().cpu().numpy()); i += len(chunk)
+        if DEVICE == "cuda": torch.cuda.empty_cache()
+    return np.concatenate(outs, axis=0)    # (n_series, n_samples, PRED)
 
 def forecast_mock(contexts, n_samples):
     n = len(contexts); H = CONFIG["PRED"]; ids = np.zeros((n, 32), dtype=np.int64)
