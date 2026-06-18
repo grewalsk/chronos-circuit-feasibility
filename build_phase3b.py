@@ -45,6 +45,12 @@ reported as a `cross` locus. Otherwise: **DISTRIBUTED** (the de-confounded, stro
 reported as a **necessity** number only; the `random@N` head-count null is a demoted **sanity baseline**.
 
 > Run `MODE="mock_cpu"` first (CPU, tiny random T5, **not interpretable**), then `MODE="pilot_t4"` on a **T4**.
+>
+> **Free-T4 disconnects are handled.** Both experiments **checkpoint incrementally** (after each `(seed,
+> condition)` block and each `(seed, f)` sweep unit). If Colab drops, just **re-run the notebook** — it resumes
+> from the last saved unit. On Colab the checkpoints persist to **Google Drive** (`USE_DRIVE`, one-time auth
+> prompt) so they survive even a full runtime reset; set `CHRONOS_3B_FORCE=1` to recompute from scratch.
+>
 > Guardrails: original Chronos-T5 only; HF forward-hook backend; per-head **mean-ablation**; honest negatives.
 """)
 
@@ -55,6 +61,8 @@ import os
 CONFIG = {
     "MODE": "mock_cpu",                 # -> "pilot_t4" on a T4 GPU
     "model_id": "amazon/chronos-t5-base",
+    "USE_DRIVE": True,                   # on Colab, persist checkpoints to Google Drive so a runtime reset
+                                        # (free-tier disconnect) does NOT lose progress; falls back to /content
     "SEED0": 0,
     "PERIODS": [8, 12, 16, 24],
     "N_SEEDS": 3,
@@ -62,7 +70,7 @@ CONFIG = {
     "CTX": 256,
     "PRED": 64,
     "OBS_NOISE": 0.30,
-    "N_CRPS_SAMPLES": 100,
+    "N_CRPS_SAMPLES": 64,                # dominant memory/time lever (gating metric is structural, not CRPS)
     "N_BOOTSTRAP": 1000,
     "FORECAST_BATCH": 4,                 # series per predict() call (T4-memory safe; auto-halves on OOM)
     "N_RANDOM_DRAWS": 8,                 # size-matched random@N (f=1) head-count baseline draws
@@ -90,9 +98,19 @@ if MODE == "mock_cpu": CONFIG.update(CONFIG["mock_cpu"])
 IS_MOCK = (MODE == "mock_cpu")
 MOCK_TAG = "  [MOCK_CPU — NOT INTERPRETABLE]" if IS_MOCK else ""
 ON_COLAB = os.path.isdir("/content")
-CKPT_DIR = "/content" if ON_COLAB else os.path.abspath(".")
+CKPT_DIR = os.path.abspath(".")
+if ON_COLAB:
+    CKPT_DIR = "/content"
+    if CONFIG.get("USE_DRIVE", True) and not IS_MOCK:   # mount Drive so checkpoints survive a runtime reset
+        try:
+            from google.colab import drive
+            drive.mount("/content/drive")
+            CKPT_DIR = "/content/drive/MyDrive/chronos_phase3b"; os.makedirs(CKPT_DIR, exist_ok=True)
+            print("checkpoints -> Google Drive (survives disconnects):", CKPT_DIR)
+        except Exception as e:
+            print("Drive mount skipped (", repr(e)[:80], ") -> /content (lost on a full runtime reset)")
 print(f"MODE={MODE}{MOCK_TAG}  periods={CONFIG['PERIODS']} seeds={CONFIG['N_SEEDS']} series={CONFIG['N_SERIES']} "
-      f"ctx={CONFIG['CTX']} pred={CONFIG['PRED']}  F_GRID={CONFIG['F_GRID']}")
+      f"ctx={CONFIG['CTX']} pred={CONFIG['PRED']}  F_GRID={CONFIG['F_GRID']}  ckpt={CKPT_DIR}")
 """)
 
 # ============================================================================
@@ -366,11 +384,26 @@ code(r"""
 def _crps_vec(fc, tgt): return np.array([crps_samples(fc[i], tgt[i]) for i in range(len(tgt))])
 def _struct_vec(fc, Ps, tgt, cond): return np.array([structure(cond, fc[i].mean(0), Ps[i], tgt[i]) for i in range(len(tgt))])
 
+# ---- incremental checkpoint / resume: a Colab disconnect just RE-RUN and it continues -----------
+FORCE = os.environ.get("CHRONOS_3B_FORCE", "0") == "1"
+def _ckp(name): return os.path.join(CKPT_DIR, f"phase3b_{MODE}_{name}.json")
+def _load_recs(name):
+    p = _ckp(name)
+    if os.path.exists(p) and not FORCE:
+        try: return json.load(open(p))
+        except Exception: return []
+    return []
+def _save_recs(name, recs): json.dump(recs, open(_ckp(name), "w"))
+
 def run_full_site():
-    recs = []
+    recs = _load_recs("full")
+    done = {(r["seed"], r["cond"]) for r in recs if r.get("kind") == "random"}   # block ends with the random rec
+    recs = [r for r in recs if (r["seed"], r["cond"]) in done]                    # drop any partial block
     for seed in range(CONFIG["N_SEEDS"]):
-        rng = np.random.default_rng(CONFIG["SEED0"] + seed)
-        for cond in CONFIG["CONDITIONS_3B"]:
+        for ci, cond in enumerate(CONFIG["CONDITIONS_3B"]):
+            if (seed, cond) in done:
+                print(f"  [ckpt] full-site ({seed},{cond}) resumed"); continue
+            rng = np.random.default_rng(CONFIG["SEED0"] + seed * 100 + ci)        # per-unit seed -> resume-deterministic
             ctx, tgt, Ps = make_batch(cond, rng, CONFIG["N_SERIES"])
             clear_ablations(SITES); fc0 = FORECAST(ctx, CONFIG["N_CRPS_SAMPLES"])
             crps0 = _crps_vec(fc0, tgt); s0 = _struct_vec(fc0, Ps, tgt, cond)
@@ -385,8 +418,8 @@ def run_full_site():
                 rel_draws.append(rel_collapse(s0, _struct_vec(fc, Ps, tgt, cond))[0])
                 crps_draws.append(float((_crps_vec(fc, tgt) - crps0).mean()))
             recs.append(dict(seed=seed, cond=cond, kind="random", rel_draws=rel_draws, crps_draws=crps_draws))
-            clear_ablations(SITES)
-        print(f"  full-site seed {seed} done")
+            clear_ablations(SITES); _save_recs("full", recs)                      # checkpoint after each block
+            print(f"  full-site ({seed},{cond}) done + saved")
     return recs
 
 print("Experiment A (full-site)..." + MOCK_TAG); FULL = run_full_site()
@@ -403,26 +436,32 @@ at the matched total (`round(f·N)` heads). We track **motif** structural collap
 """)
 code(r"""
 def run_sweep():
-    recs = []
+    recs = _load_recs("sweep")
+    done = {(r["seed"], round(r["f"], 4)) for r in recs}            # only complete (seed,f) units are ever saved
+    recs = [r for r in recs if (r["seed"], round(r["f"], 4)) in done]
     for seed in range(CONFIG["SWEEP_SEEDS"]):
-        rng = np.random.default_rng(CONFIG["SEED0"] + 100 + seed)
-        batches = {c: make_batch(c, rng, CONFIG["SWEEP_SERIES"]) for c in CONFIG["CONDITIONS_3B"]}
-        clean = {}
-        for c, (ctx, tgt, Ps) in batches.items():
-            clear_ablations(SITES); clean[c] = _struct_vec(FORECAST(ctx, CONFIG["N_CRPS_SAMPLES"]), Ps, tgt, c)
-        for f in CONFIG["F_GRID"]:
+        for fi, f in enumerate(CONFIG["F_GRID"]):
+            if (seed, round(f, 4)) in done:
+                print(f"  [ckpt] sweep ({seed},f={f}) resumed"); continue
+            # batches deterministic per (seed,cond); ablation rng deterministic per (seed,f) -> resume-stable
+            batches = {c: make_batch(c, np.random.default_rng(CONFIG["SEED0"] + 5000 + seed * 10 + ci), CONFIG["SWEEP_SERIES"])
+                       for ci, c in enumerate(CONFIG["CONDITIONS_3B"])}
+            clean = {}
+            for c, (ctx, tgt, Ps) in batches.items():
+                clear_ablations(SITES); clean[c] = _struct_vec(FORECAST(ctx, CONFIG["N_CRPS_SAMPLES"]), Ps, tgt, c)
+            arng = np.random.default_rng(CONFIG["SEED0"] + 6000 + seed * 100 + fi)
+            unit = []
             for d in range(CONFIG["SWEEP_DRAWS"]):
                 for arm in CONFIG["SITES_3B"] + ["random"]:
                     rel = {}
                     for c, (ctx, tgt, Ps) in batches.items():
-                        if arm == "random": set_random_pool(SITES, HEAD_POOL, max(1, int(round(f * N))), rng)
-                        else:               set_fraction_site(SITES, arm, f, rng)
+                        if arm == "random": set_random_pool(SITES, HEAD_POOL, max(1, int(round(f * N))), arng)
+                        else:               set_fraction_site(SITES, arm, f, arng)
                         rel[c] = rel_collapse(clean[c], _struct_vec(FORECAST(ctx, CONFIG["N_CRPS_SAMPLES"]), Ps, tgt, c))[0]
-                    recs.append(dict(seed=seed, f=f, draw=d, arm=arm,
-                                     motif=rel["motif"], nonper=max(rel["trend"], rel["changepoint"]),
-                                     trend=rel["trend"], changepoint=rel["changepoint"]))
-            clear_ablations(SITES)
-        print(f"  sweep seed {seed} done")
+                    unit.append(dict(seed=seed, f=f, draw=d, arm=arm, motif=rel["motif"],
+                                     nonper=max(rel["trend"], rel["changepoint"]), trend=rel["trend"], changepoint=rel["changepoint"]))
+            recs += unit; clear_ablations(SITES); _save_recs("sweep", recs)
+            print(f"  sweep ({seed},f={f}) done + saved")
     return recs
 
 print("Experiment B (fraction sweep)..." + MOCK_TAG); SWEEP = run_sweep()
