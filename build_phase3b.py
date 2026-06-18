@@ -39,11 +39,14 @@ effect: only the period structure collapses.
    **selective** collapse at **low `f`**, where the channel is nowhere near severed. The dose-response *shape*
    settles it.
 
-**Decision rule (baked in, not prose).** `enc_self` / `dec_self` localize iff they show a **selective structural
-collapse** (period-P power collapses; trend-slope & changepoint-level survive). **`cross` localizes iff that AND
-the selective effect appears at low `f`** (not only at `f=1`) — so a severance artifact at `f=1` can never be
-reported as a `cross` locus. Otherwise: **DISTRIBUTED** (the de-confounded, stronger result). Global ΔCRPS is
-reported as a **necessity** number only; the `random@N` head-count null is a demoted **sanity baseline**.
+**Decision rule (baked in, not prose).** A site is a **LOCUS** iff it shows a **selective structural collapse**
+(period-P power collapses; trend-slope & changepoint-level survive) **AND** its collapse **exceeds the
+size-matched `random@N` null** — a valid control for the non-bottleneck sites `enc_self`/`dec_self` (a real
+locus must beat "remove N random heads", not merely be selective). **`cross` additionally requires the selective
+effect at low `f`** (not only at `f=1`) — so a severance artifact can never be reported as a `cross` locus.
+Otherwise: **DISTRIBUTED** (the de-confounded, stronger result). Global ΔCRPS is a **necessity** number only.
+(The head-count null is thus a **gate**, not a demoted baseline — its one blind spot, the cross bottleneck, is
+covered by the low-`f` requirement.)
 
 > Run `MODE="mock_cpu"` first (CPU, tiny random T5, **not interpretable**), then `MODE="pilot_t4"` on a **T4**.
 >
@@ -506,42 +509,46 @@ def low_f_selective(site):
     return False, None
 
 def summarize():
+    # size-matched random@N null (f=1) on motif structure: a GATE every site must beat (a valid size-matched
+    # control for the non-bottleneck sites; cross additionally needs the low-f test for the severance blind spot).
+    null = [v for r in FULL if r["kind"] == "random" and r["cond"] == "motif" for v in r["rel_draws"]]
+    null_p = float(np.percentile(null, 95)) if null else 0.0
     rows = []
     for site in CONFIG["SITES_3B"]:
         ss = selective_structural(site); lf, lff = low_f_selective(site)
-        is_cross = (site == "cross")
-        locus = ss["selective_structural"] and (lf if is_cross else True)
-        rows.append(dict(site=site, **ss, low_f_selective=bool(lf), low_f=lff,
+        is_cross = (site == "cross"); beats_null = ss["motif"] > null_p
+        locus = ss["selective_structural"] and beats_null and (lf if is_cross else True)
+        rows.append(dict(site=site, **ss, beats_null=bool(beats_null), low_f_selective=bool(lf), low_f=lff,
                          dcrps_motif=_mean(site, "motif", "dcrps_mean"),
                          dcrps_trend=_mean(site, "trend", "dcrps_mean"),
                          dcrps_changepoint=_mean(site, "changepoint", "dcrps_mean"),
                          gated_on_low_f=is_cross, locus=bool(locus)))
-    null = [v for r in FULL if r["kind"] == "random" and r["cond"] == "motif" for v in r["rel_draws"]]
-    null_p = float(np.percentile(null, 95)) if null else 0.0
     loci = [r for r in rows if r["locus"]]
     verdict = (f"LOCUS = {max(loci, key=lambda r: r['motif'])['site']}" if loci else "DISTRIBUTED")
 
-    print("=" * 84); print(f"PHASE 3b VERDICT: {verdict}{MOCK_TAG}"); print("=" * 84)
-    print(f"structural rel-collapse (fraction of structure destroyed); selectivity = motif >> trend/changepoint")
-    print(f"  {'site':9s} {'motif':>7s} {'trend':>7s} {'chgpt':>7s}  {'sel-struct':>10s} {'low-f sel':>9s}  "
-          f"{'ΔCRPS mot':>9s}  LOCUS")
+    print("=" * 90); print(f"PHASE 3b VERDICT: {verdict}{MOCK_TAG}"); print("=" * 90)
+    print("rel-collapse (fraction destroyed); LOCUS = selective AND beats size-matched null (cross also needs low-f)")
+    print(f"  {'site':9s} {'motif':>7s} {'trend':>7s} {'chgpt':>7s}  {'sel':>4s} {'>null':>5s} {'low-f':>6s}  "
+          f"{'ΔCRPS':>8s}  LOCUS")
     for r in rows:
-        lowf = f"yes@{r['low_f']}" if r["low_f_selective"] else "no"
+        lowf = f"y@{r['low_f']}" if r["low_f_selective"] else "no"
         print(f"  {r['site']:9s} {r['motif']:+7.3f} {r['trend']:+7.3f} {r['changepoint']:+7.3f}  "
-              f"{str(r['selective_structural']):>10s} {lowf:>9s}  {r['dcrps_motif']:+9.4f}  "
-              f"{'*' if r['locus'] else ''}{'  (gated:low-f)' if r['gated_on_low_f'] else ''}")
-    print(f"\n  sanity baseline: random@N motif rel-collapse p95 = {null_p:+.3f} (head-count null, demoted)")
-    # detection-power, structural
+              f"{str(r['selective_structural'])[:1]:>4s} {str(r['beats_null'])[:1]:>5s} {lowf:>6s}  "
+              f"{r['dcrps_motif']:+8.3f}  {'*' if r['locus'] else ''}{' (cross:low-f-gated)' if r['gated_on_low_f'] else ''}")
+    print(f"\n  size-matched random@N null (motif rel-collapse, p95) = {null_p:+.3f}   [GATE: a locus must exceed this]")
     best = max(rows, key=lambda r: r["motif"] if np.isfinite(r["motif"]) else -1e9)
-    if any(r["selective_structural"] for r in rows):
-        print(f"  DETECTION POWER: at least one site shows selective structural collapse -> method CAN localize.")
+    if any(r["selective_structural"] and r["beats_null"] for r in rows):
+        print("  DETECTION POWER: a site selectively collapses period structure ABOVE the null -> method CAN localize.")
     else:
-        print(f"  DETECTION POWER: no site selectively collapses period structure (best='{best['site']}', "
-              f"motif rel {best['motif']:+.3f}) -> the DISTRIBUTED null is real, not underpowered.")
+        print(f"  DETECTION POWER: no site selectively collapses period structure above the size-matched null "
+              f"(best motif rel {best['motif']:+.3f} vs null {null_p:+.3f}) -> the DISTRIBUTED null is real, not underpowered.")
     cr = next(r for r in rows if r["site"] == "cross")
     if cr["selective_structural"] and not cr["low_f_selective"]:
-        print(f"  CROSS: selective at f=1 but NOT at low f -> consistent with channel SEVERANCE, not a locus "
-              f"(correctly NOT reported as a cross locus).")
+        print("  CROSS: selective at f=1 but NOT at low f -> channel SEVERANCE, not a locus (correctly excluded).")
+    for r in rows:
+        if r["selective_structural"] and not r["beats_null"]:
+            print(f"  NOTE: {r['site']} is selective but does NOT beat the size-matched null "
+                  f"({r['motif']:+.3f} <= {null_p:+.3f}) -> not a locus (collapse is within what N random heads do).")
     return dict(verdict=verdict, rows=rows, null_p95=null_p, mode=MODE, mock=IS_MOCK, N=int(N),
                 thresholds={k: CONFIG[k] for k in ("STRUCT_COLLAPSE_MIN", "SELECTIVITY_MARGIN", "LOW_F_MAX")})
 
