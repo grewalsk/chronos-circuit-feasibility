@@ -11,6 +11,7 @@ def code(s): CELLS.append(("code", s.strip("\n")))
 
 # ============================================================================
 md(r"""
+__PROFILE_BANNER__
 # Phase 3b — Site-Isolated Ablation: Locus vs Distributed (structural-selectivity verdict)
 
 **Goal.** The pilot's *nested* ladder collapsed period structure only at `+dec_self` (176/432 heads) — confounded
@@ -96,6 +97,8 @@ MODE = os.environ.get("CHRONOS_3B_MODE", CONFIG["MODE"])
 assert MODE in ("mock_cpu", "pilot_t4"), MODE
 if MODE == "mock_cpu": CONFIG.update(CONFIG["mock_cpu"])
 IS_MOCK = (MODE == "mock_cpu")
+CONFIG["RUN_TAG"] = "__RUN_TAG__"     # distinguishes fast vs full checkpoints & output JSON
+__PROFILE_OVERRIDE__
 MOCK_TAG = "  [MOCK_CPU — NOT INTERPRETABLE]" if IS_MOCK else ""
 ON_COLAB = os.path.isdir("/content")
 CKPT_DIR = os.path.abspath(".")
@@ -386,7 +389,7 @@ def _struct_vec(fc, Ps, tgt, cond): return np.array([structure(cond, fc[i].mean(
 
 # ---- incremental checkpoint / resume: a Colab disconnect just RE-RUN and it continues -----------
 FORCE = os.environ.get("CHRONOS_3B_FORCE", "0") == "1"
-def _ckp(name): return os.path.join(CKPT_DIR, f"phase3b_{MODE}_{name}.json")
+def _ckp(name): return os.path.join(CKPT_DIR, f"phase3b_{MODE}_{CONFIG.get('RUN_TAG','full')}_{name}.json")
 def _load_recs(name):
     p = _ckp(name)
     if os.path.exists(p) and not FORCE:
@@ -577,18 +580,40 @@ except Exception as e:
 md("## 12. Checkpoint")
 code(r"""
 out = dict(summary=SUMMARY, full_site=FULL, sweep=SWEEP)
-p = os.path.join(CKPT_DIR, f"phase3b_{MODE}.json")
+p = os.path.join(CKPT_DIR, f"phase3b_{MODE}_{CONFIG.get('RUN_TAG','full')}.json")
 with open(p, "w") as f: json.dump(out, f, indent=2)
 print("wrote", p, "->", SUMMARY["verdict"], MOCK_TAG)
 """)
 
-# ---- assemble ----------------------------------------------------------------------------------
+# ---- assemble (one notebook per profile: fast | full) ------------------------------------------
+import os as _os
+PROFILE = _os.environ.get("PHASE3B_PROFILE", "full")
+assert PROFILE in ("fast", "full"), PROFILE
+if PROFILE == "fast":
+    BANNER = ("> ## ⚡ FAST profile (lean settings for a quick first verdict — ~20 min on a free T4).\n"
+              "> Use `phase3b_full.ipynb` for publication-resolution numbers. Outputs/checkpoints are tagged "
+              "`fast` so the two runs never collide.\n")
+    OVERRIDE = ("if MODE == 'pilot_t4':\n"
+                "    CONFIG.update(dict(N_SEEDS=2, N_SERIES=16, N_CRPS_SAMPLES=48, SWEEP_DRAWS=2,\n"
+                "                       SWEEP_SERIES=12, F_GRID=[0.1, 0.25, 0.5, 1.0]))\n"
+                "    print('FAST profile (pilot): N_SEEDS=2 N_SERIES=16 N_CRPS=48 SWEEP_DRAWS=2 "
+                "SWEEP_SERIES=12 F_GRID=[0.1,0.25,0.5,1.0]')")
+else:
+    BANNER = ("> ## 🧪 FULL profile (publication-resolution: 3 seeds, 32 series, 5-point sweep).\n"
+              "> Slower — lean on the **checkpoint/resume** (re-run after any disconnect). Outputs/checkpoints "
+              "are tagged `full`.\n")
+    OVERRIDE = "pass  # FULL profile uses the default CONFIG resolution"
+
+def _resolve(s): return s.replace("__PROFILE_BANNER__", BANNER).replace("__RUN_TAG__", PROFILE).replace("__PROFILE_OVERRIDE__", OVERRIDE)
+RES = [(t, _resolve(s)) for (t, s) in CELLS]
+
 nb = new_notebook()
-nb.cells = [new_markdown_cell(s) if t == "md" else new_code_cell(s) for (t, s) in CELLS]
+nb.cells = [new_markdown_cell(s) if t == "md" else new_code_cell(s) for (t, s) in RES]
 nb.metadata = {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
                "language_info": {"name": "python"}, "colab": {"provenance": []}, "accelerator": "GPU"}
-with open("phase3b.ipynb", "w") as f: nbf.write(nb, f)
-with open("_mirror_3b.py", "w") as f:
-    f.write("\n".join(["# auto-mirror of phase3b code cells"] +
-                      ["\n# " + "=" * 60 + "\n" + s for t, s in CELLS if t == "code"]))
-print(f"wrote phase3b.ipynb ({sum(t=='code' for t,_ in CELLS)} code cells) + _mirror_3b.py")
+out_ipynb = f"phase3b_{PROFILE}.ipynb"; out_mirror = f"_mirror_3b_{PROFILE}.py"
+with open(out_ipynb, "w") as f: nbf.write(nb, f)
+with open(out_mirror, "w") as f:
+    f.write("\n".join([f"# auto-mirror of {out_ipynb} code cells"] +
+                      ["\n# " + "=" * 60 + "\n" + s for t, s in RES if t == "code"]))
+print(f"wrote {out_ipynb} (profile={PROFILE}, {sum(t=='code' for t,_ in RES)} code cells) + {out_mirror}")
