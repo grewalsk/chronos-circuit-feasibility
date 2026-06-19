@@ -1,7 +1,8 @@
 # STATE — Chronos Selective Periodic-Induction Circuit
 
-*Living status doc. Last updated after the **Phase 3b** site-isolated full-resolution run on `chronos-t5-base`
-(2026-06-18). Phases 0–3 + Phase 3b are built and run; the causal result is complete and de-confounded.*
+*Living status doc. Last updated after the **Phase 4** change-detection run on `chronos-t5-large` (2026-06-19).
+Phases 0–3 + Phase 3b (periodicity) + Phase 4 (change-detection) are built and run; both causal results are
+complete and de-confounded — **both forecasting computations are DISTRIBUTED across attention**, at Base and Large.*
 
 ---
 
@@ -26,6 +27,21 @@ degrades both equally), and the dose-response shows periodic collapse is an **en
 ablation) while non-periodic structure collapses earlier — so **no attention site localizes periodicity**. The
 draft Results paragraph + Fig 4 caption are in [`RESULTS_phase3b.md`](RESULTS_phase3b.md). The causal result is
 done; remaining items are generalization (ETT) + writing, not the result itself.
+
+**Phase 4 (change-detection, the affirmative-circuit attempt) → DISTRIBUTED on `chronos-t5-large`.** Mishra
+reports change-detection as causally dominant via *mid-encoder level-shift SAE features*, so this was the best
+shot at a localized circuit — and it is the highest-value disambiguator because Large is *Mishra's own model*.
+Result: **encoder-self is necessary in aggregate** (full-site changepoint collapse **0.660**, 95% CI 0.530–0.784,
+vs random@N null **0.243**; cross 0.485; dec-self below null) **but not selective** (it collapses periodicity 0.549
+≈ change-detection 0.660) **and not localized** — the top-8 behavioral candidate heads reproduce only **~12%** of
+the site collapse (best single head 0.039, group 0.081), with **no sufficient set ≤8 heads** and a pure **endpoint
+dose-response** (changepoint ≈0 until f>0.5, 0.70 at f=1; non-target collapses early). The automated verdict reads
+"SPLIT" (5 single heads beat a ~0 within-site null) but the localized tail is faint → **report as distributed with
+a weak localized component, not a circuit.** Draft Results + Fig 5 caption in
+[`RESULTS_phase4.md`](RESULTS_phase4.md); result = [`phase4_pilot_a100.json`](phase4_pilot_a100.json), figure =
+[`fig5_phase4_pilot_a100.png`](fig5_phase4_pilot_a100.png). **The base-too-small escape hatch is closed (this is
+Large).** Net: *both* forecasting computations Chronos implements (periodicity + change-detection) are distributed
+across attention — the paper is a circuit-level adjudication of the attention-degeneration debate at both scales.
 
 ---
 
@@ -127,6 +143,56 @@ metric is unstable (negative collapses) — the verdict rests on motif + changep
 
 ---
 
+## 2c. Phase 4 — change-detection circuit on `chronos-t5-large` (the affirmative-circuit attempt)
+
+`phase4.ipynb` (single-source builder `build_phase4.py`) **reuses all the 3b machinery** (the `.o` per-head
+mean-ablation hook, `SITES`, equal-size / site-isolated / `random@N` ablation, structural rel-collapse + bootstrap,
+dose-response sweep, cross low-`f` rule, checkpoint/resume) and changes **only the target** to level shifts. New for
+Phase 4: a **standardized delta-normalized median `changepoint_recovery`** metric (re-runs the 3b changepoint
+baseline under it — the old 0.726 is **not** cited once the metric changed; re-measured value = **0.660**);
+**CTX-relative level-shift stimuli** with metadata threaded through `make_batch` (τ inside context, ≥30% post-shift);
+a **behavioral scan** = delta-response (record-mode reuse of the `.o` hook) + boundary attention (a **manual
+`output_attentions` forward**, since `pipeline.predict`'s generate path does not surface attentions); **head-level
+single/group ablation** (the only localization adjudicator); **relative-depth Mishra cross-check** (~45–55% encoder
+depth, not literal block 11 = a Large index); a **trend-based binned** delta-monotonicity assert; and a
+**multi-seed** dose-response. MODE/MODEL switch: `mock_cpu | pilot_t4` (base) `| pilot_a100` (Large). A 5-dimension
+adversarial review hardened the verdict logic (notably: a LOCALIZED claim now requires the winning site to be
+necessary first — ≥ `STRUCT_COLLAPSE_MIN` **and** beat random@N — so a small set can never "reproduce most of" a
+non-existent collapse).
+
+**Verdict: DISTRIBUTED (faint SPLIT tail).** Run = Large, 24 encoder layers, 384 heads/site, 3 seeds × 32 series,
+2-seed 5-point sweep. Full-site changepoint collapse vs random@N null (p95 = **0.243**):
+
+| site | changepoint collapse [95% CI] | motif | trend | >null? | selective? |
+|---|---|---|---|---|---|
+| enc_self | **+0.660** [0.530, 0.784] | +0.549 | −0.529 | yes | **no** (motif ≈ changepoint) |
+| cross | +0.485 [0.326, 0.646] | +0.461 | −0.805 | yes | no (motif ≈ changepoint) |
+| dec_self | +0.168 [0.060, 0.287] | +0.252 | −0.258 | **no** | no (below null) |
+
+**Necessity yes, localization no.** Encoder-self is necessary in aggregate but (a) **not selective** — it collapses
+periodicity ≈ as much as change-detection — and (b) **not localized**: the **top-8 behavioral candidate heads
+reproduce only ~12%** of the 0.660 site collapse (best single head **L9H4 = 0.039**, top-8 group **0.081**), **no
+sufficient set ≤8 heads**. The **dose-response** is the clincher: changepoint collapse is an **endpoint effect**
+(≈0 at f=0.1/0.25/0.5 → 0.42 at 0.75 → 0.70 at 1.0) while **non-target structure collapses early** (0.34 at f=0.1)
+— the exact distributed signature periodicity gave in 3b. The automated verdict prints **"SPLIT"** because 5 of 8
+single heads beat a **~0** within-site `k=1` null, but the partial-localization tail is faint → **reported as
+distributed with a weak localized component, not a circuit.** Detection power is real (0.660 ≫ 0.243 null → a
+de-confounded null, not underpowered).
+
+**Mishra reconciliation (the headline future-work hook).** Mechanism probes (exploratory — nothing localized) on
+the top candidates show attention **routes** boundary info — **boundary-local** (corr w/ global offset −0.015) and
+**recency**-biased (mass 1.90 most-recent vs 0.73 older) — but scales only weakly with shift size (δ-slope +0.093,
+R²=0.26). Candidate enc-self layers spread across depth (rel-depths 0.00–0.57; only **L12 @0.52** inside Mishra's
+mid-encoder band). The honest reconciliation: attention carries boundary/recency signals, but the level-shift
+**detection is plausibly MLP/feature-mediated** — which we do **not** trace (head-level attention only). This is
+why Mishra's SAEs localize a *feature* mid-encoder while the *attention heads* are distributed. **The base-too-small
+ambiguity is closed: this is Large, Mishra's own model.**
+
+*Caveats:* trend metric unstable (lean on changepoint gate + motif selectivity); mechanism + Mishra-depth probes are
+exploratory (nothing localized to validate them on); ETT real-data generalization still outstanding (as for 3b).
+
+---
+
 ## 3. The nuance — what this paper is (and isn't)
 
 **"Circuit-level analysis" describes the granularity and methods, not whether a clean circuit was found.**
@@ -168,25 +234,32 @@ who finds a protein is intrinsically disordered did structural biology; "no rigi
 
 ## 4. What's left before the writeup (roadmap)
 
-**Tier 1 — ✅ DONE (Phase 3b):**
+**Tier 1 — ✅ DONE (Phase 3b + Phase 4):**
 - ✅ **Phase 3b — site-isolated, equal-size ablation** (built + run, fast + full) → **DISTRIBUTED**, de-confounded
   (§2b). Site-isolated ablation removes the size confound; the dose-response + beat-null + low-`f` gates close the
   redundancy-masking and cross-bottleneck blind spots.
-- ✅ **Detection-power statement** — baked into the verdict (large effects detected, none selective → real null).
-- ⏳ **Robustness across `obs_noise`/more sweep seeds** — partial: 2 seeds (fast) + 3 seeds (full) agree;
-  recommended polish = bump the sweep to 2–3 seeds + swap the unstable trend metric for low-freq power retained,
-  then one more L4 run for the final Fig 4c.
+- ✅ **Phase 4 — change-detection circuit on `chronos-t5-large`** (built + run, §2c) → **DISTRIBUTED** (faint SPLIT
+  tail). The best shot at an affirmative circuit, on Mishra's own model: enc-self necessary (0.660 vs 0.243 null)
+  but non-selective and non-localized (top-8 = ~12% of site; endpoint dose-response). **Closes the base-too-small
+  ambiguity.** Both forecasting computations are now distributed.
+- ✅ **Detection-power statement** — baked into both verdicts (large effects detected, none selective → real null).
+- ⏳ **Robustness across `obs_noise`/more sweep seeds** — 3b: 2+3 seeds agree; Phase 4: 2 sweep seeds. Recommended
+  polish = swap the unstable trend metric for low-freq power retained on the final figures.
 
 **Tier 2 — generalization (credibility):**
-- **ETT real-data** confirmation (spec Phase 4) — reproduces "no localized circuit; structure survives small
-  ablation" on real seasonality. Closes the #1 reviewer objection.
-- **Base → Large** (`chronos-t5-large`, 710M, Mishra's model; A100) — within-family universality. The one
-  expensive item; a strengthener for the distributed result, not a blocker for a workshop submission.
+- **ETT real-data** confirmation — reproduces "no localized circuit; structure survives small ablation" on real
+  seasonality / real regime shifts. Closes the #1 reviewer objection; now the main remaining must-have.
+- ✅ **Base → Large** — DONE via Phase 4 (`chronos-t5-large`, 710M, Mishra's model, A100). Within-family
+  universality confirmed for change-detection; periodicity-on-Large is an optional extra (the distributed verdict
+  already holds at both scales for change-detection).
 
 **Tier 3 — mechanism depth (turns "distributed" into a characterization):**
-- Trace the stages: the `enc_self L5H7` compressed "period-detector" (T=0.918, slope 0.18) and the staged
-  feeders → the dec_self heads carrying the structure (spec's estimate → aggregate → select).
-- SAE cross-validation vs Mishra (does the distributed locus map to his "seasonality" features?).
+- **MLP / feature circuits — now the HEADLINE future work.** Phase 4 shows attention *routes* boundary/recency
+  signals but the level-shift *detection* is plausibly MLP/feature-mediated (reconciles Mishra's mid-encoder SAE
+  *features* localizing while the *attention heads* are distributed). Transcoder / MLP tracing is the natural next
+  step and the strongest framing for the paper's limitation→future-work arc.
+- Trace the 3b stages: the `enc_self L5H7` compressed "period-detector" (T=0.918, slope 0.18) and staged feeders.
+- SAE cross-validation vs Mishra (does the distributed locus map to his "seasonality" / level-shift features?).
 
 **Tier 4 — writing & figures (spec Phase 5):**
 - Fig 1 schematic · Fig 2 lag-tracking heatmap · Fig 3 copying · Fig 4 causal selectivity + nested ladder ·
@@ -194,9 +267,10 @@ who finds a protein is intrinsically disordered did structural biology; "no rigi
 - Verify every arXiv ID; correct the 2510.09776 framing (linear attention, regime not covered); cite time2time
   and draw the layer-steering-vs-circuit line; limitations (synthetic + ETT, head-level, redundancy, 3b caveat).
 
-**Critical path to a defensible workshop submission:** ~~3b~~ ✅ → **ETT** (the one remaining must-have) →
-writing. Optional polish: final Fig 4c (more sweep seeds + sturdier trend metric), mechanism tracing, Large
-(A100). The causal result is **done**; what remains is generalization + writing, not the finding.
+**Critical path to a defensible workshop submission:** ~~3b~~ ✅ → ~~Large~~ ✅ (Phase 4) → **ETT** (the one
+remaining must-have) → writing. Optional polish: sturdier trend metric, MLP/feature tracing. Both causal results
+(periodicity + change-detection, Base + Large) are **done**; what remains is real-data generalization + writing,
+not the finding.
 
 ---
 
@@ -204,10 +278,13 @@ writing. Optional polish: final Fig 4c (more sweep seeds + sturdier trend metric
 
 - `chronos_circuit_feasibility.ipynb` — the Phases 0–3 deliverable notebook (mock_cpu → pilot_t4).
 - `phase3b_fast.ipynb` / `phase3b_full.ipynb` — the site-isolated Phase 3b (lean first verdict / publication res).
-- `build_notebook.py`, `build_phase3b.py` — single-source builders for the two notebooks.
+- `phase4.ipynb` — Phase 4 change-detection notebook (mock_cpu | pilot_t4=base | pilot_a100=Large).
+- `build_notebook.py`, `build_phase3b.py`, `build_phase4.py` — single-source builders for the notebooks.
 - `PHASE3_REDESIGN.md` — rationale for the redesigned, non-circular Phase 3 (confirmatory gate + ladder +
   mechanism decomposition) and the two adversarial-review passes.
-- `RESULTS_phase3b.md` — the draft Results paragraph + Fig 4 caption (numbers verified vs the JSON).
+- `RESULTS_phase3b.md` — Phase 3b draft Results + Fig 4 caption (numbers verified vs the JSON).
+- `RESULTS_phase4.md` — Phase 4 draft Results + Fig 5 caption (numbers verified vs `phase4_pilot_a100.json`).
+- `phase4_pilot_a100.json` / `fig5_phase4_pilot_a100.png` — Phase 4 Large result (§2c) + Fig 5.
 - `phase1_pilot_t4.json`, `phase2_pilot_t4.json`, `phase3_pilot_t4new.json` — Phase 1/2/3 pilot checkpoints (§2).
 - `phase3b_pilot_t4_full.json` — Phase 3b full result (§2b); `fig4b_site_isolated.png` = Fig 4.
 - `*.png` — Fig 2 (lag-tracking), Fig 3 (copying), Fig 4/4b (causal), stimulus sanity.
