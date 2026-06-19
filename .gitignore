@@ -6,6 +6,10 @@ ckpt/
 ckpt_chronos_circuit/
 circuitTSFM/
 
+# phase4 mock_cpu smoke outputs (NOT interpretable; real pilot_t4/a100 artifacts are kept)
+phase4_mock_cpu*.json
+fig5_phase4_mock_cpu.png
+
 # notebook + python cruft
 .ipynb_checkpoints/
 __pycache__/
