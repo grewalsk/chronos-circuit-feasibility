@@ -1,6 +1,7 @@
 # STATE — Chronos Selective Periodic-Induction Circuit
 
-*Living status doc. Last updated after the redesigned `pilot_t4` run on `chronos-t5-base` (2026-06-15).*
+*Living status doc. Last updated after the **Phase 3b** site-isolated full-resolution run on `chronos-t5-base`
+(2026-06-18). Phases 0–3 + Phase 3b are built and run; the causal result is complete and de-confounded.*
 
 ---
 
@@ -17,6 +18,14 @@ ablating the identified candidates leaves the forecast's period structure intact
 *more* than periodicity; the structure only collapses under site-scale ablation. This is a clean, **trustworthy**
 null (the CRPS floor was real this time) and a publishable paper: first head-level circuit-discovery methods
 applied to a TSFM + a circuit-level adjudication of the attention-degeneration debate.
+
+**Phase 3b (site-isolated, equal-size ablation) now DE-CONFOUNDS it → DISTRIBUTED, conclusively.** Ablating each
+attention site in isolation (144 heads each) vs a size-matched random null: **all three sites collapse period-P
+power above the null, but none selectively** (enc-self collapses *changepoint* more than periodicity; cross
+degrades both equally), and the dose-response shows periodic collapse is an **endpoint effect** (only near full
+ablation) while non-periodic structure collapses earlier — so **no attention site localizes periodicity**. The
+draft Results paragraph + Fig 4 caption are in [`RESULTS_phase3b.md`](RESULTS_phase3b.md). The causal result is
+done; remaining items are generalization (ETT) + writing, not the result itself.
 
 ---
 
@@ -87,6 +96,37 @@ Raw checkpoints in the repo: `phase1_pilot_t4.json`, `phase2_pilot_t4.json`, `ph
 
 ---
 
+## 2b. Phase 3b — site-isolated de-confounding (the FINAL causal result)
+
+The Phase-3 ladder collapsed at `+dec_self` (176/432 heads), confounded with ablation **size**. Phase 3b ablates
+each site **in isolation** (all 144 enc-self / dec-self / cross heads), scores **structural collapse** per
+condition (period-P power / trend-slope / changepoint-level recovery — not global CRPS), and gates a LOCUS on
+*selective* collapse that **beats the size-matched `random@N` null** (cross additionally needs the effect at low
+fraction `f`, since ablating all cross severs the encoder→decoder channel). Two notebooks: **`phase3b_fast.ipynb`**
+(lean, ~30 min) and **`phase3b_full.ipynb`** (3 seeds, 32 series, 5-point sweep). Full result =
+`phase3b_pilot_t4_full.json`, figure = `fig4b_site_isolated.png`.
+
+**Verdict: DISTRIBUTED.** Full-site motif period-P collapse (95% CI), random null p95 = **0.219**:
+
+| site | motif collapse [95% CI] | trend | changepoint | selective? |
+|---|---|---|---|---|
+| enc_self | +0.551 [0.341, 0.755] | +0.285 | **+0.726** | no (changepoint collapses *more*) |
+| dec_self | +0.255 [0.134, 0.381] | −0.447 | +0.091 | no (below the 0.30 floor) |
+| cross | +0.453 [0.276, 0.629] | −1.266 | +0.459 | no (motif ≈ changepoint) |
+
+**Dose-response (Fig 4c):** periodic collapse is an **endpoint effect** — ~0 at low `f` for every site, rising
+only near `f=1`; non-periodic structure collapses *earlier/harder* (enc-self at `f=0.25`: motif −0.05 vs
+non-periodic +0.49). `low_f_selective = False` for all sites → **no site localizes periodicity at a non-severing
+fraction.** Detection power is real (enc-self 0.55 ≫ 0.22 null) — a de-confounded null, not underpowered.
+
+**Bonus:** enc-self collapses changepoint (0.726) > periodicity (0.551) → encoder self-attention is the most
+generally-necessary site with a **change-detection lean** — a direct corroboration of Mishra.
+
+*Caveats:* the sweep is single-seed (Fig 4c shape robust, exact low-`f` values noisy); the trend-slope-recovery
+metric is unstable (negative collapses) — the verdict rests on motif + changepoint.
+
+---
+
 ## 3. The nuance — what this paper is (and isn't)
 
 **"Circuit-level analysis" describes the granularity and methods, not whether a clean circuit was found.**
@@ -128,13 +168,14 @@ who finds a protein is intrinsically disordered did structural biology; "no rigi
 
 ## 4. What's left before the writeup (roadmap)
 
-**Tier 1 — must-have, cheap (free-T4):**
-- **Phase 3b — site-isolated, equal-size ablation.** all-enc_self vs all-dec_self vs all-cross vs 144 random
-  heads (matched size), ΔCRPS + Δ period-P power on motif. De-confounds the locus from ablation size. *(Not yet
-  implemented; the one immediate next coding step.)*
-- **Detection-power statement.** The method *can* catch a localized head if one exists (the ladder's +dec_self
-  Δstruct +0.291, CI excluding 0, is the positive control) — state so the null isn't read as underpowered.
-- **Robustness.** Confirm the distributed verdict is invariant across seeds and `obs_noise ∈ {0.15, 0.30, 0.45}`.
+**Tier 1 — ✅ DONE (Phase 3b):**
+- ✅ **Phase 3b — site-isolated, equal-size ablation** (built + run, fast + full) → **DISTRIBUTED**, de-confounded
+  (§2b). Site-isolated ablation removes the size confound; the dose-response + beat-null + low-`f` gates close the
+  redundancy-masking and cross-bottleneck blind spots.
+- ✅ **Detection-power statement** — baked into the verdict (large effects detected, none selective → real null).
+- ⏳ **Robustness across `obs_noise`/more sweep seeds** — partial: 2 seeds (fast) + 3 seeds (full) agree;
+  recommended polish = bump the sweep to 2–3 seeds + swap the unstable trend metric for low-freq power retained,
+  then one more L4 run for the final Fig 4c.
 
 **Tier 2 — generalization (credibility):**
 - **ETT real-data** confirmation (spec Phase 4) — reproduces "no localized circuit; structure survives small
@@ -153,25 +194,30 @@ who finds a protein is intrinsically disordered did structural biology; "no rigi
 - Verify every arXiv ID; correct the 2510.09776 framing (linear attention, regime not covered); cite time2time
   and draw the layer-steering-vs-circuit line; limitations (synthetic + ETT, head-level, redundancy, 3b caveat).
 
-**Critical path to a defensible workshop submission:** `3b → robustness/power → ETT` (all free-T4, a day or two).
-Large and the mechanism-depth tracing elevate it to the conference-length version.
+**Critical path to a defensible workshop submission:** ~~3b~~ ✅ → **ETT** (the one remaining must-have) →
+writing. Optional polish: final Fig 4c (more sweep seeds + sturdier trend metric), mechanism tracing, Large
+(A100). The causal result is **done**; what remains is generalization + writing, not the finding.
 
 ---
 
 ## 5. Repo contents
 
-- `chronos_circuit_feasibility.ipynb` — the deliverable notebook (Phases 0–3; mock_cpu → pilot_t4).
-- `build_notebook.py` — single-source builder that generates the notebook (+ a `_mirror.py` for local testing).
-- `PHASE3_REDESIGN.md` — the rationale for the redesigned, non-circular Phase 3 (confirmatory gate + ladder +
-  mechanism decomposition) and the two adversarial-review passes applied.
-- `phase1_pilot_t4.json`, `phase2_pilot_t4.json`, `phase3_pilot_t4new.json` — the pilot checkpoints (the numbers
-  in §2 come from these).
-- `*.png` — Fig 2 (lag-tracking), Fig 3 (copying), Fig 4 (causal), stimulus sanity.
+- `chronos_circuit_feasibility.ipynb` — the Phases 0–3 deliverable notebook (mock_cpu → pilot_t4).
+- `phase3b_fast.ipynb` / `phase3b_full.ipynb` — the site-isolated Phase 3b (lean first verdict / publication res).
+- `build_notebook.py`, `build_phase3b.py` — single-source builders for the two notebooks.
+- `PHASE3_REDESIGN.md` — rationale for the redesigned, non-circular Phase 3 (confirmatory gate + ladder +
+  mechanism decomposition) and the two adversarial-review passes.
+- `RESULTS_phase3b.md` — the draft Results paragraph + Fig 4 caption (numbers verified vs the JSON).
+- `phase1_pilot_t4.json`, `phase2_pilot_t4.json`, `phase3_pilot_t4new.json` — Phase 1/2/3 pilot checkpoints (§2).
+- `phase3b_pilot_t4_full.json` — Phase 3b full result (§2b); `fig4b_site_isolated.png` = Fig 4.
+- `*.png` — Fig 2 (lag-tracking), Fig 3 (copying), Fig 4/4b (causal), stimulus sanity.
 - Authoritative design lives in the separate repo `github.com/grewalsk/circuitTSFM`
   (`chronos_circuit_spec_v2.md`, `chronos_circuit_plan_v2.md`), cloned into the session by Section 0.
 
 ## 6. Reproduce
 
-Open in Colab → run `mock_cpu` (default, CPU smoke test, ~minutes, **not interpretable**) → set
-`CONFIG["MODE"]="pilot_t4"`, switch to a T4 GPU, Run all (~30–45 min) for the real verdict. Checkpoints are
-per-stage, so a disconnect resumes mid-phase. `CHRONOS_CIRCUIT_FORCE=1` forces recompute.
+**Phases 0–3:** open `chronos_circuit_feasibility.ipynb` in Colab → `mock_cpu` (CPU smoke test) → set
+`MODE="pilot_t4"`, T4 GPU, Run all (~30–45 min). Per-stage checkpoints resume on disconnect.
+**Phase 3b:** open `phase3b_fast.ipynb` (or `_full`) → `mock_cpu` → `MODE="pilot_t4"`, **any CUDA GPU** (T4/L4),
+Run all. Incremental checkpoints persist to **Google Drive** (`USE_DRIVE`) so disconnects just resume; `_full`
+≈ ~2 h on T4 (less on L4). `CHRONOS_CIRCUIT_FORCE=1` / `CHRONOS_3B_FORCE=1` force recompute.

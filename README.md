@@ -12,6 +12,16 @@ mechanistic‑interpretability study of the original **Chronos‑T5** time‑ser
 
 The deliverable is one file: [`chronos_circuit_feasibility.ipynb`](chronos_circuit_feasibility.ipynb).
 
+> **Current result (chronos‑t5‑base): DISTRIBUTED.** Phase 1 finds lag‑tracking heads *are* present in attention
+> and some also copy, but Phase 3 + the de‑confounded **Phase 3b** (site‑isolated, equal‑size ablation) show **no
+> attention site causally localizes periodicity** — period structure survives partial ablation and collapses only
+> near full‑site ablation, while non‑periodic structure collapses earlier. So Chronos *represents* periodicity in
+> attention but does **not** localize it to a selective‑induction head; the computation is **distributed/redundant**
+> — a circuit‑level adjudication of the attention‑degeneration debate that corroborates Mishra & Pandey while
+> nuancing them. See [`STATE.md`](STATE.md) (status + exact numbers) and [`RESULTS_phase3b.md`](RESULTS_phase3b.md)
+> (draft Results paragraph). Phase 3b notebooks: [`phase3b_fast.ipynb`](phase3b_fast.ipynb) /
+> [`phase3b_full.ipynb`](phase3b_full.ipynb).
+
 ---
 
 ## Why this is interesting
