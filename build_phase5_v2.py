@@ -414,6 +414,8 @@ def _load(name):
 def _save(name, obj): json.dump(obj, open(_ckp(name), "w"), default=lambda o: o.tolist() if hasattr(o,"tolist") else str(o))
 
 def orient():
+    ck = _load("orient")
+    if ck is not None: print("  [ckpt] orientation resumed -> SAE layer L%d" % ck["layer"]); return ck
     rng = np.random.default_rng(CONFIG["SEED0"] + 11)
     cc, co, tg, mt = make_cf_battery(rng, CONFIG["N_PAIRS"], *CONFIG["DELTA_PRIMARY"])
     clear_hooks(); s0 = cp_vec(forecast_raw(cc, CONFIG["N_CRPS_SAMPLES"]), mt)
@@ -428,7 +430,7 @@ def orient():
     top = scan[0][0]
     print(f"  orientation mid-encoder scan (layer: changepoint collapse): " + ", ".join(f"L{l}@{rel_depth(l):.2f}={v:+.2f}" for l, v in scan))
     print(f"  -> SAE layer = enc_mlp L{top} (rel-depth {rel_depth(top):.2f})")
-    return dict(layer=int(top), scan=scan, clean_recovery=float(s0.mean()))
+    res = dict(layer=int(top), scan=scan, clean_recovery=float(s0.mean())); _save("orient", res); return res
 
 print("Orientation (non-gating)..." + MOCK_TAG); ORIENT = orient(); SAE_LAYER = ORIENT["layer"]
 """)
@@ -460,6 +462,7 @@ LAYER_MOD = MLP_MODS["enc_mlp"][SAE_LAYER]
 _rng = np.random.default_rng(CONFIG["SEED0"] + 21)
 CC, CO, TG, MT = make_cf_battery(_rng, CONFIG["N_PAIRS"], *CONFIG["DELTA_PRIMARY"])     # primary-SNR battery
 H_clean = capture_h(LAYER_MOD, CC); H_corr = capture_h(LAYER_MOD, CO)
+torch.manual_seed(CONFIG["SEED0"])     # SAE init/training reproducible regardless of prior RNG use (checkpoint-resume safe)
 SAE, RECON_LOSS, N_FEAT = build_sae(H_clean.reshape(-1, D_MODEL), D_MODEL)
 assert_error_identity(SAE, H_clean[:1])                                                # HARD ASSERT (error node)
 F_clean = SAE.encode(H_clean); F_corr = SAE.encode(H_corr)                             # cached counterfactual feats
@@ -519,10 +522,11 @@ def _idx_tensor(ids): return torch.as_tensor(list(ids), dtype=torch.long, device
 
 def faithfulness_curve():
     nf = F_clean.shape[-1]; all_ids = set(range(nf))
-    clear_hooks(); base = cp_vec(forecast_raw(CC, CONFIG["N_CRPS_SAMPLES"]), MT)   # unpatched clean recovery
-    rows = []
+    clear_hooks(); base = cp_vec(forecast_raw(CC, CONFIG["N_CRPS_SAMPLES"]), MT)   # unpatched clean recovery (deterministic)
+    rows = _load("faith") or []; done = {r["k"] for r in rows}                     # per-k incremental resume
     rng = np.random.default_rng(CONFIG["SEED0"] + 33)
     for k in [kk for kk in CONFIG["K_GRID"] if kk <= nf]:
+        if k in done: print(f"    [ckpt] faith k={k} resumed"); continue
         keep = set(IE_ORDER[:k]); ablate = _idx_tensor(all_ids - keep)              # patch the COMPLEMENT to corrupt
         fk = cp_vec(forecast_cf(CC, LAYER_MOD, SAE, ablate, F_corr, CONFIG["N_CRPS_SAMPLES"]), MT)
         fk_m, fk_ci = mean_ci(fk)
@@ -530,9 +534,11 @@ def faithfulness_curve():
         for _ in range(CONFIG["N_RANDOM_NULL"]):
             rk = set(int(x) for x in rng.choice(nf, size=k, replace=False)); abl = _idx_tensor(all_ids - rk)
             nulls.append(float(cp_vec(forecast_cf(CC, LAYER_MOD, SAE, abl, F_corr, CONFIG["N_CRPS_SAMPLES"]), MT).mean()))
-        rows.append(dict(k=k, faith=fk_m, faith_ci=fk_ci, faith_frac=float(fk_m/(base.mean()+1e-6)),
+        rows.append(dict(k=int(k), faith=fk_m, faith_ci=fk_ci, faith_frac=float(fk_m/(base.mean()+1e-6)),
                          null_mean=float(np.mean(nulls)), null_p95=float(np.percentile(nulls, 95))))
+        _save("faith", rows)                                                       # checkpoint after each k
         print(f"    k={k:4d}  faith={fk_m:.3f} [{fk_ci[0]:.2f},{fk_ci[1]:.2f}]  frac={rows[-1]['faith_frac']:.2f}  null={rows[-1]['null_mean']:.3f}")
+    rows.sort(key=lambda r: r["k"])
     return dict(base=float(base.mean()), rows=rows)
 print("Faithfulness vs set-size (noising of the complement)..." + MOCK_TAG); FAITH = faithfulness_curve()
 """)
@@ -558,8 +564,9 @@ def completeness_and_selectivity():
     # no-op; using the no-shift baseline lets the control actually FAIL if those features carry periodicity [review FIX].
     corr_baseline = F_corr.mean(dim=(0, 1), keepdim=True)                       # (1,1,nf) per-feature no-shift value
     src_motif = corr_baseline.expand(len(mctx), F_m.shape[1], -1).contiguous()
-    rows = []
+    rows = _load("complete") or []; done = {r["k"] for r in rows}               # per-k incremental resume
     for k in [kk for kk in CONFIG["K_GRID"] if kk <= nf]:
+        if k in done: print(f"    [ckpt] complete k={k} resumed"); continue
         idx = _idx_tensor(IE_ORDER[:k])
         # change-detection completeness: patch top-k to corrupt on the clean changepoint run
         cab = cp_vec(forecast_cf(CC, LAYER_MOD, SAE, idx, F_corr, CONFIG["N_CRPS_SAMPLES"]), MT)
@@ -572,10 +579,12 @@ def completeness_and_selectivity():
         for _ in range(CONFIG["N_RANDOM_NULL"]):
             rk = _idx_tensor(rng.choice(nf, size=k, replace=False))
             nulls.append(float((base - cp_vec(forecast_cf(CC, LAYER_MOD, SAE, rk, F_corr, CONFIG["N_CRPS_SAMPLES"]), MT)).mean()))
-        rows.append(dict(k=k, cp_complete=cp_drop, cp_ci=cp_ci, motif_drop=mot_drop,
+        rows.append(dict(k=int(k), cp_complete=cp_drop, cp_ci=cp_ci, motif_drop=mot_drop,
                          null_mean=float(np.mean(nulls)), null_p95=float(np.percentile(nulls, 95)),
                          selective=bool(cp_drop >= CONFIG["SELECTIVITY_MARGIN"] * max(mot_drop, 1e-6) and cp_drop > float(np.percentile(nulls, 95)))))
+        _save("complete", rows)                                                # checkpoint after each k
         print(f"    k={k:4d}  cp_complete={cp_drop:+.3f} [{cp_ci[0]:+.2f},{cp_ci[1]:+.2f}]  motif_drop={mot_drop:+.3f}  null={rows[-1]['null_mean']:+.3f}  selective={rows[-1]['selective']}")
+    rows.sort(key=lambda r: r["k"])
     return dict(base=float(base.mean()), motif_base=float(mbase.mean()), rows=rows)
 print("Completeness + motif selectivity (noising the top-k)..." + MOCK_TAG); COMPLETE = completeness_and_selectivity()
 """)
@@ -592,8 +601,10 @@ code(r"""
 def denoising_curve():
     nf = F_clean.shape[-1]
     clear_hooks(); corr_base = cp_vec(forecast_raw(CO, CONFIG["N_CRPS_SAMPLES"]), MT)   # ~0: no shift to recover
-    rng = np.random.default_rng(CONFIG["SEED0"] + 55); rows = []
+    rng = np.random.default_rng(CONFIG["SEED0"] + 55)
+    rows = _load("denoise") or []; done = {r["k"] for r in rows}                        # per-k incremental resume
     for k in [kk for kk in CONFIG["K_GRID"] if kk <= nf]:
+        if k in done: print(f"    [ckpt] denoise k={k} resumed"); continue
         idx = _idx_tensor(IE_ORDER[:k])
         suf = cp_vec(forecast_cf(CO, LAYER_MOD, SAE, idx, F_clean, CONFIG["N_CRPS_SAMPLES"]), MT)
         suf_m, suf_ci = mean_ci(suf)
@@ -601,9 +612,11 @@ def denoising_curve():
         for _ in range(CONFIG["N_RANDOM_NULL"]):
             rk = _idx_tensor(rng.choice(nf, size=k, replace=False))
             nulls.append(float(cp_vec(forecast_cf(CO, LAYER_MOD, SAE, rk, F_clean, CONFIG["N_CRPS_SAMPLES"]), MT).mean()))
-        rows.append(dict(k=k, induced=suf_m, induced_ci=suf_ci, gain=float(suf_m - corr_base.mean()),
+        rows.append(dict(k=int(k), induced=suf_m, induced_ci=suf_ci, gain=float(suf_m - corr_base.mean()),
                          null_mean=float(np.mean(nulls)), null_p95=float(np.percentile(nulls, 95))))
+        _save("denoise", rows)                                                         # checkpoint after each k
         print(f"    k={k:4d}  induced_recovery={suf_m:.3f} [{suf_ci[0]:.2f},{suf_ci[1]:.2f}]  gain_over_corrupt={rows[-1]['gain']:+.3f}  null={rows[-1]['null_mean']:.3f}")
+    rows.sort(key=lambda r: r["k"])
     return dict(corrupt_base=float(corr_base.mean()), rows=rows)
 print("Denoising / sufficiency (steering no-shift -> shift)..." + MOCK_TAG); DENOISE = denoising_curve()
 """)
@@ -614,11 +627,13 @@ md(r"""
 """)
 code(r"""
 def snr_sweep():
-    out = []
+    out = _load("snr") or []; done = {tuple(r["delta"]) for r in out}              # per-regime incremental resume
     for (dl, dh) in CONFIG["SNR_DELTAS"]:
+        if (dl, dh) in done: print(f"    [ckpt] snr delta[{dl},{dh}] resumed"); continue
         rng = np.random.default_rng(CONFIG["SEED0"] + 66 + int(dl * 100))
         cc, co, tg, mt = make_cf_battery(rng, CONFIG["SNR_PAIRS"], dl, dh)
         Hc = capture_h(LAYER_MOD, cc); Ho = capture_h(LAYER_MOD, co)
+        torch.manual_seed(CONFIG["SEED0"] + int(dl * 100))     # per-regime SAE reproducible (checkpoint-resume safe)
         sae, _l, nf = build_sae(Hc.reshape(-1, D_MODEL), D_MODEL)
         Fc = sae.encode(Hc); Fo = sae.encode(Ho)
         taus = [m["tau"] for m in mt]; dpost = torch.zeros(nf, device=DEVICE)
@@ -627,13 +642,14 @@ def snr_sweep():
         wn = W.norm(dim=0) if (W.dim() == 2 and W.shape[1] == nf) else torch.ones(nf, device=DEVICE)
         order = list(np.argsort(-(dpost * wn).detach().cpu().numpy()))
         clear_hooks(); base = cp_vec(forecast_raw(cc, CONFIG["N_CRPS_SAMPLES"]), mt)
-        allids = set(range(nf)); fr = {}
+        allids = set(range(nf)); fr = []                                           # list of [k, frac] (JSON-safe; no int keys)
         for k in [kk for kk in CONFIG["SNR_KS"] if kk <= nf]:
             abl = _idx_tensor(allids - set(order[:k]))
             fk = float(cp_vec(forecast_cf(cc, LAYER_MOD, sae, abl, Fo, CONFIG["N_CRPS_SAMPLES"]), mt).mean())
-            fr[k] = fk / (base.mean() + 1e-6)
+            fr.append([int(k), fk / (base.mean() + 1e-6)])
         out.append(dict(delta=[dl, dh], clean_recovery=float(base.mean()), faith_frac_by_k=fr))
-        print(f"    delta[{dl},{dh}] clean_rec={base.mean():.2f}  faith_frac " + " ".join(f"k{k}:{v:.2f}" for k, v in fr.items()))
+        _save("snr", out)                                                          # checkpoint after each regime
+        print(f"    delta[{dl},{dh}] clean_rec={base.mean():.2f}  faith_frac " + " ".join(f"k{k}:{v:.2f}" for k, v in fr))
     return out
 print("SNR sweep (localization vs difficulty)..." + MOCK_TAG); SNR = snr_sweep()
 """)
@@ -714,7 +730,8 @@ try:
     b.set_title("Fig 6b: completeness vs motif + null (CIs)", fontsize=9)
     c = ax[1, 0]
     for r in SNR:
-        ks3 = sorted(r["faith_frac_by_k"].keys()); c.plot(ks3, [r["faith_frac_by_k"][k] for k in ks3], "o-", label=f"δ[{r['delta'][0]},{r['delta'][1]}] (rec {r['clean_recovery']:.2f})")
+        pairs = sorted(r["faith_frac_by_k"], key=lambda p: p[0]); ks3 = [p[0] for p in pairs]
+        c.plot(ks3, [p[1] for p in pairs], "o-", label=f"δ[{r['delta'][0]},{r['delta'][1]}] (rec {r['clean_recovery']:.2f})")
     c.axhline(CONFIG["FAITH_TARGET"], color="k", ls=":", lw=1); c.set_xscale("log", base=2)
     c.set_xlabel("feature-set size k"); c.set_ylabel("faithfulness (frac)"); c.legend(fontsize=7)
     c.set_title("Fig 6c: SNR sweep — localization vs difficulty", fontsize=9)
