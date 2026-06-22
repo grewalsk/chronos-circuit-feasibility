@@ -43,6 +43,28 @@ a weak localized component, not a circuit.** Draft Results + Fig 5 caption in
 Large).** Net: *both* forecasting computations Chronos implements (periodicity + change-detection) are distributed
 across attention — the paper is a circuit-level adjudication of the attention-degeneration debate at both scales.
 
+**Phase 5 (does it live in the MLPs / features?) → DISTRIBUTED at every granularity, on `chronos-t5-large`.** The
+attention analysis was attention-only; Pandey (nonlinear/MLP) and Mishra (mid-encoder level-shift SAE *features*)
+both point to MLPs. **Phase 5 (layer-level)** found enc-MLP necessary in aggregate (full-site changepoint collapse
+**0.506** vs random-MLP null 0.365) **but not localized** (top-8 layers grouped 0.205 *below* the random-8 null —
+the best layers underperform random; endpoint dose-response) → distributed across MLP layers too. An adversarial
+audit then found that layer-level verdict **untrustworthy for the localization question** (wrong granularity vs
+Mishra's *features*; off-distribution mean-ablation; trend-driven selectivity; saturated stimuli; a gate that
+skipped the feature test). **Phase 5 v2 (the corrected test)** redid it at the *feature* level with **counterfactual
+interchange ablation** (minimal pairs, SAE features, error node carried, noising+denoising, motif-only selectivity,
+SNR sweep, CIs, unconditional). Verdict = **B: DISTRIBUTED at the feature level, SAE-vs-circuit discrepancy
+AIRTIGHT** — decided by **sufficiency**: injecting the top change-features into no-shift runs induces **no** level
+change (max denoising gain **−0.0003** vs a 0.15 bar); completeness ≤0.012 (≈1.3% of clean 0.896); faithfulness is
+a *degenerate* pass (L14 bypassable: top-k = random null ~0.81); no SNR sharpening; MDE 0.094 (de-confounded, not
+underpowered). Draft Results + Fig 6 in [`RESULTS_phase5_v2.md`](RESULTS_phase5_v2.md); result =
+[`phase5v2_pilot_a100.json`](phase5v2_pilot_a100.json), figure = [`fig6_phase5v2_pilot_a100.png`](fig6_phase5v2_pilot_a100.png).
+**Net (3b/4/5):** change-detection (and periodicity) in Chronos-T5-Large is **distributed across attention heads,
+MLP layers, AND mid-encoder MLP features** — Mishra's SAE features do **not** form a small *sufficient* causal
+circuit; SAE-feature-vs-causal-circuit correspondence is a positive methodological finding. *Caveat (stated
+plainly):* v2 traced one layer (L14, only 0.021 single-layer necessity); a **cross-layer** feature circuit (L9–L17
+union) is the one untested granularity — built as **Phase 5 v3** ([`phase5_v3.ipynb`](phase5_v3.ipynb), counterfactual
+union-ablation across the top-N mid-encoder layers), not yet run on GPU.
+
 ---
 
 ## 1. Pipeline status (chronos-t5-base, pilot_t4)
@@ -267,10 +289,12 @@ who finds a protein is intrinsically disordered did structural biology; "no rigi
 - Verify every arXiv ID; correct the 2510.09776 framing (linear attention, regime not covered); cite time2time
   and draw the layer-steering-vs-circuit line; limitations (synthetic + ETT, head-level, redundancy, 3b caveat).
 
-**Critical path to a defensible workshop submission:** ~~3b~~ ✅ → ~~Large~~ ✅ (Phase 4) → **ETT** (the one
-remaining must-have) → writing. Optional polish: sturdier trend metric, MLP/feature tracing. Both causal results
-(periodicity + change-detection, Base + Large) are **done**; what remains is real-data generalization + writing,
-not the finding.
+**Critical path to a defensible workshop submission:** ~~3b~~ ✅ → ~~Large~~ ✅ (Phase 4) → ~~MLP/feature tracing~~
+✅ (Phase 5 v2, feature-level distributed/airtight) → **ETT** (the one remaining must-have) → writing. Optional
+tightening: run **Phase 5 v3** (cross-layer feature union, the last untested granularity) on a high-RAM A100;
+sturdier trend metric. All causal results (periodicity + change-detection; attention, MLP layers, MLP features;
+Base + Large) are **done** and consistently DISTRIBUTED; what remains is real-data generalization + writing, not
+the finding.
 
 ---
 
@@ -279,12 +303,19 @@ not the finding.
 - `chronos_circuit_feasibility.ipynb` — the Phases 0–3 deliverable notebook (mock_cpu → pilot_t4).
 - `phase3b_fast.ipynb` / `phase3b_full.ipynb` — the site-isolated Phase 3b (lean first verdict / publication res).
 - `phase4.ipynb` — Phase 4 change-detection notebook (mock_cpu | pilot_t4=base | pilot_a100=Large).
-- `build_notebook.py`, `build_phase3b.py`, `build_phase4.py` — single-source builders for the notebooks.
+- `phase5.ipynb` — Phase 5 layer-level MLP ablation (superseded for localization by v2; see §2-TLDR).
+- `phase5_v2.ipynb` — Phase 5 v2 counterfactual FEATURE-level ablation (the corrected localization test).
+- `phase5_v3.ipynb` — Phase 5 v3 CROSS-LAYER feature union test (closes the single-layer caveat; not yet GPU-run).
+- `build_notebook.py`, `build_phase3b.py`, `build_phase4.py`, `build_phase5.py`, `build_phase5_v2.py`,
+  `build_phase5_v3.py` — single-source builders for the notebooks.
 - `PHASE3_REDESIGN.md` — rationale for the redesigned, non-circular Phase 3 (confirmatory gate + ladder +
   mechanism decomposition) and the two adversarial-review passes.
 - `RESULTS_phase3b.md` — Phase 3b draft Results + Fig 4 caption (numbers verified vs the JSON).
 - `RESULTS_phase4.md` — Phase 4 draft Results + Fig 5 caption (numbers verified vs `phase4_pilot_a100.json`).
+- `RESULTS_phase5_v2.md` — Phase 5 v2 draft Results + Fig 6 caption (numbers verified vs `phase5v2_pilot_a100.json`).
 - `phase4_pilot_a100.json` / `fig5_phase4_pilot_a100.png` — Phase 4 Large result (§2c) + Fig 5.
+- `phase5_pilot_a100.json` — Phase 5 layer-level Large result; `phase5v2_pilot_a100.json` /
+  `fig6_phase5v2_pilot_a100.png` — Phase 5 v2 feature-level Large result (the airtight feature-level distributed null).
 - `phase1_pilot_t4.json`, `phase2_pilot_t4.json`, `phase3_pilot_t4new.json` — Phase 1/2/3 pilot checkpoints (§2).
 - `phase3b_pilot_t4_full.json` — Phase 3b full result (§2b); `fig4b_site_isolated.png` = Fig 4.
 - `*.png` — Fig 2 (lag-tracking), Fig 3 (copying), Fig 4/4b (causal), stimulus sanity.
