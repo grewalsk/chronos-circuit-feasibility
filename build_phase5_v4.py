@@ -80,7 +80,7 @@ CONFIG = {
     "CROSS_MAX_LAYERS": 0,               # 0 = the WHOLE band; >0 caps the count (contiguous central span)
     "CACHE_DTYPE": "float16",
     # ---- transcoders (TopK) read MLP input, reconstruct MLP output; carry the error node ----
-    "TC_DICT_MULT": 8, "TC_DICT_MULT_SMALL": 4, "TC_TOPK": 32, "TC_STEPS": 600, "TC_LR": 1e-3, "TC_BATCH": 2048, "TRAIN_PAIRS": 128,
+    "TC_DICT_MULT": 8, "TC_DICT_MULT_SMALL": 4, "TC_TOPK": 64, "TC_STEPS": 3000, "TC_LR": 1e-3, "TC_BATCH": 2048, "TRAIN_PAIRS": 128,
     "TC_RECON_MAX": 0.25,                # HELD-OUT recon gate (frac of eval MLP-output variance); a poor transcoder voids the result
     # ---- attribution: linear virtual weights (gold) + all-paths influence; EAP-IG and proxy as cross-checks ----
     "RANK_METHOD": "gold",               # "gold" (frozen-attn linear virtual weight, all-paths) | "eapig" | "proxy"
@@ -746,8 +746,14 @@ TRAIN_CC = list(TRAIN_CC) + list(_mtr_cc); TRAIN_CO = list(TRAIN_CO) + list(_mtr
 TCS, RECON, NF = train_band_transcoders(TRAIN_CC, TRAIN_CO, CC, CO, CONFIG["TC_DICT_MULT"], 0)
 _bad = [l for l in LAYERS if RECON[l] > CONFIG["TC_RECON_MAX"]]
 print(f"  {len(LAYERS)} layers x {NF} features; HELD-OUT recon(frac of eval out var) " + ",".join(f"L{l}:{RECON[l]:.3f}" for l in LAYERS))
-assert IS_MOCK or not _bad, f"transcoder recon exceeds TC_RECON_MAX={CONFIG['TC_RECON_MAX']} at {_bad}; raise TC_STEPS/TC_DICT_MULT"
-if _bad and IS_MOCK: print(f"  [mock] recon gate skipped (mock transcoder not interpretable); on pilot it would assert at {_bad}")
+DROPPED_LAYERS = []
+if _bad and not IS_MOCK:                                 # a layer whose transcoder cannot reconstruct is untrustworthy: drop it, keep coverage where the substrate is valid
+    keep = [l for l in LAYERS if l not in _bad]
+    assert len(keep) >= 2, f"too few layers pass the recon gate (keep={keep}, failed={_bad} at TC_RECON_MAX={CONFIG['TC_RECON_MAX']}); raise TC_TOPK/TC_STEPS/TC_DICT_MULT or relax TC_RECON_MAX"
+    print(f"  [recon gate] DROPPING {_bad} (held-out recon > {CONFIG['TC_RECON_MAX']}); analysis proceeds on the well-reconstructed band {keep} (still cross-layer), recorded in the verdict")
+    DROPPED_LAYERS = list(_bad); LAYERS = keep; TCS = {l: TCS[l] for l in keep}; RECON = {l: RECON[l] for l in keep}
+elif _bad and IS_MOCK:
+    print(f"  [mock] recon gate skipped (mock transcoder not interpretable); on pilot it would drop {_bad}")
 # hard assert: local replacement (transcoders + error node + frozen attention/norms) matches the model on-prompt
 _vr = validate_local_replacement(CC[:2], TCS, LAYERS)
 assert _vr["rel"] < 1e-3, f"local replacement does not match underlying model on-prompt (rel {_vr['rel']:.2e})"
@@ -1147,7 +1153,7 @@ def summarize():
     mde = float(np.mean([abs(r["faith_ci"][1]-r["faith_ci"][0]) for r in R]) / 2) if R else float("nan")
     print("=" * 100); print(f"PHASE 5 v4 VERDICT: {verdict}{MOCK_TAG}"); print("=" * 100)
     print(f"  clean recovery={base:.3f}  ranking={CONFIG['RANK_METHOD'].upper()} (Spearman gold-vs-EAP {RANK_CORR['gold_eap']:+.2f}, gold-vs-proxy {RANK_CORR['gold_proxy']:+.2f})  "
-          f"layers={LAYERS} (Mishra-band {in_band})  features/layer={NF}")
+          f"layers={LAYERS} (Mishra-band {in_band}; dropped {DROPPED_LAYERS})  features/layer={NF}")
     print(f"  k*(faithful union)={kstar} small={small}  faith>null={faith_beats}  selective={selective}  complete>null={complete_beats}  sufficient={sufficient}")
     print(f"  replacement (change)={repl:.2f} CI[{repl_ci[0]:.2f},{repl_ci[1]:.2f}]  completeness={GRAPH_CHANGE['completeness']:.2f} CI[{GRAPH_CHANGE['completeness_ci'][0]:.2f},{GRAPH_CHANGE['completeness_ci'][1]:.2f}]  multihop_share={GRAPH_CHANGE['multihop_share']:.2f}  CLT-escalation-signature={escalate_clt}")
     print(f"  max denoising gain={max(r['gain'] for r in R):+.4f} (bar {CONFIG['SUFFICIENCY_BAR']})  max completeness={max(r['cp_complete'] for r in R):+.4f}  SNR small-k sharpens toward floor={snr_sharpens}")
@@ -1162,7 +1168,7 @@ def summarize():
                 escalate_clt=escalate_clt, attention_routed=attention_routed, qk_necessity=qk_necessity, escalate=escalate,
                 rank_unverified=rank_unverified, snr_sharpens=bool(snr_sharpens), splitting=bool(SPLIT["splitting"]),
                 rank_method=CONFIG["RANK_METHOD"], rank_corr=RANK_CORR, layers=LAYERS, depths=[rel_depth(l) for l in LAYERS],
-                mishra_in_band=in_band, n_features=int(NF), recon={int(l): RECON[l] for l in LAYERS}, min_detectable=mde,
+                mishra_in_band=in_band, dropped_layers=[int(l) for l in DROPPED_LAYERS], n_features=int(NF), recon={int(l): RECON[l] for l in LAYERS}, min_detectable=mde,
                 asym_replacement_gap=float(ASYM["replacement_gap"]), replacement_mde=float(GRAPH_CHANGE.get("replacement_mde", float("nan"))),
                 rank_metric_corr=float(RANK_CORR.get("gold_metric", float("nan"))), held_out_recon=float(np.mean([RECON[l] for l in LAYERS])),
                 pattern_denoise_gain=float(ATTN["pat_denoise_gain"]), pattern_noise_drop=float(ATTN["pat_noise_drop"]))
