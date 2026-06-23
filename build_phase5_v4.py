@@ -299,7 +299,8 @@ def _tokenize(contexts):
     ct = torch.tensor(np.asarray(contexts), dtype=DTYPE); ids, am, _s = PIPE.tokenizer.context_input_transform(ct); return ids.to(DEVICE), am.to(DEVICE)
 def _tok_scale(contexts):
     if IS_MOCK: ids, am = _tokenize(contexts); return ids, am, None
-    ct = torch.tensor(np.asarray(contexts), dtype=DTYPE); ids, am, scale = PIPE.tokenizer.context_input_transform(ct); return ids.to(DEVICE), am.to(DEVICE), scale.to(DEVICE)
+    ct = torch.tensor(np.asarray(contexts), dtype=DTYPE); ids, am, scale = PIPE.tokenizer.context_input_transform(ct)
+    return ids.to(DEVICE), am.to(DEVICE), scale   # keep scale on the tokenizer (CPU) device so label_input_transform matches lab; only token ids go to GPU
 def _target_tokens(targets, scale):
     if IS_MOCK:
         arrs = []
