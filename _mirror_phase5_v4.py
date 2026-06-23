@@ -15,14 +15,15 @@ CONFIG = {
     "CROSS_MAX_LAYERS": 0,               # 0 = the WHOLE band; >0 caps the count (contiguous central span)
     "CACHE_DTYPE": "float16",
     # ---- transcoders (TopK) read MLP input, reconstruct MLP output; carry the error node ----
-    "TC_DICT_MULT": 8, "TC_DICT_MULT_SMALL": 4, "TC_TOPK": 32, "TC_STEPS": 600, "TC_LR": 1e-3, "TC_BATCH": 2048,
-    "TC_RECON_MAX": 0.30,                # recon gate (frac of MLP-output variance); a poor transcoder voids the result
+    "TC_DICT_MULT": 8, "TC_DICT_MULT_SMALL": 4, "TC_TOPK": 32, "TC_STEPS": 600, "TC_LR": 1e-3, "TC_BATCH": 2048, "TRAIN_PAIRS": 128,
+    "TC_RECON_MAX": 0.25,                # HELD-OUT recon gate (frac of eval MLP-output variance); a poor transcoder voids the result
     # ---- attribution: linear virtual weights (gold) + all-paths influence; EAP-IG and proxy as cross-checks ----
     "RANK_METHOD": "gold",               # "gold" (frozen-attn linear virtual weight, all-paths) | "eapig" | "proxy"
-    "ATTR_PAIRS": 12, "ATTR_BATCH": 2, "ATTR_TOPF": 96, "ATTR_GRAPH_PAIRS": 8, "GRAPH_BOOTSTRAP": 200, "EAP_STEPS": 4,   # ATTR_TOPF = node cap for the explicit A
+    "ATTR_PAIRS": 12, "ATTR_BATCH": 2, "ATTR_TOPF": 96, "ATTR_GRAPH_PAIRS": 32, "GRAPH_BOOTSTRAP": 200, "GRAPH_REBUILDS": 3, "RANK_AGREE_MIN": 0.5, "EAP_STEPS": 4,   # ATTR_TOPF = node cap for the explicit A
     # ---- faithfulness / completeness / selectivity / sufficiency over UNION size ----
     "K_GRID": [1, 2, 4, 8, 16, 32, 64, 128], "FAITH_TARGET": 0.60, "LOCALIZE_MAX_FEATURES": 32,
-    "N_RANDOM_NULL": 8, "SELECTIVITY_MARGIN": 2.0, "FAITH_BEAT_MARGIN": 0.05, "SUFFICIENCY_BAR": 0.15,
+    "N_RANDOM_NULL": 32, "SELECTIVITY_MARGIN": 2.0, "FAITH_BEAT_MARGIN": 0.05, "SUFFICIENCY_BAR": 0.15,
+    "PATTERN_PAIRS": 8, "PATTERN_SAMPLES": 16,   # attention-pattern interchange experiment (the QK-crux causal test)
     "END_SWEEP": 3,                      # layer-range constrained patching: # of end-layers to sweep (report max)
     "MISHRA_DEPTH_LO": 0.45, "MISHRA_DEPTH_HI": 0.55,
     # ---- SNR sweep (the saturation control) ----
@@ -33,7 +34,7 @@ CONFIG = {
     "mock_cpu": {
         "PERIODS": [6, 8], "N_PAIRS": 4, "CTX": 48, "PRED": 24, "N_CRPS_SAMPLES": 12, "N_BOOTSTRAP": 50,
         "FORECAST_BATCH": 999, "TC_DICT_MULT": 4, "TC_DICT_MULT_SMALL": 2, "TC_TOPK": 4, "TC_STEPS": 40, "TC_BATCH": 64,
-        "ATTR_PAIRS": 4, "ATTR_BATCH": 2, "ATTR_TOPF": 16, "ATTR_GRAPH_PAIRS": 4, "GRAPH_BOOTSTRAP": 40, "EAP_STEPS": 2,
+        "ATTR_PAIRS": 4, "ATTR_BATCH": 2, "ATTR_TOPF": 16, "ATTR_GRAPH_PAIRS": 4, "GRAPH_BOOTSTRAP": 40, "GRAPH_REBUILDS": 2, "EAP_STEPS": 2, "TRAIN_PAIRS": 8, "PATTERN_PAIRS": 3, "PATTERN_SAMPLES": 6,
         "K_GRID": [1, 2, 4], "LOCALIZE_MAX_FEATURES": 2, "N_RANDOM_NULL": 2, "END_SWEEP": 2,
         "SNR_DELTAS": [[1.5, 3.0], [0.6, 1.0]], "SNR_PAIRS": 4, "SNR_KS": [2, 4],
     },
@@ -137,6 +138,15 @@ def make_cf_pair(ctx_len, pred_len, rng, noise, delta):
 def make_motif(P, L, rng, noise):
     m = rng.standard_normal(P); m[rng.integers(P)] += 3.0 * (1 if rng.random() > 0.5 else -1); m[P // 2:] += 1.5; m = m - m.mean()
     return np.tile(m, L // P + 2)[:L] + noise * rng.standard_normal(L)
+def make_motif_cf_battery(rng, n):
+    cc, co, tg, mt = [], [], [], []; L = CONFIG["CTX"] + CONFIG["PRED"]
+    for i in range(n):
+        P = CONFIG["PERIODS"][i % len(CONFIG["PERIODS"])]
+        m = rng.standard_normal(P); m[rng.integers(P)] += 3.0 * (1 if rng.random() > 0.5 else -1); m[P // 2:] += 1.5; m = m - m.mean()
+        periodic = np.tile(m, L // P + 2)[:L]; noise = CONFIG["OBS_NOISE"] * rng.standard_normal(L)
+        clean = periodic + noise; corrupt = np.full(L, float(periodic.mean())) + noise   # period-ABSENT, shared noise (minimal pair)
+        cc.append(clean[:CONFIG["CTX"]]); co.append(corrupt[:CONFIG["CTX"]]); tg.append(clean[CONFIG["CTX"]:]); mt.append({"P": int(P)})
+    return cc, co, np.array(tg), mt
 def make_cf_battery(rng, n, dl, dh):
     cc, co, tg, mt = [], [], [], []
     for _ in range(n):
@@ -241,17 +251,17 @@ class Transcoder(nn.Module):
         z = torch.relu(self.preact(x)); v, idx = z.topk(self.k, dim=-1); return torch.zeros_like(z).scatter_(-1, idx, v)
     def decode(self, a): return self.dec(a)
     def forward(self, x): a = self.encode(x); return self.decode(a), a
-def train_transcoder(x_in, y_out, m, seed):
+def train_transcoder(x_tr, y_tr, x_ev, y_ev, m, seed):
     tc = Transcoder(D_MODEL, D_MODEL, m, CONFIG["TC_TOPK"]).to(DEVICE)
-    torch.manual_seed(seed); tc.b_pre.data = x_in.mean(0).detach()
-    tc.dec.bias.data = y_out.mean(0).detach()
-    opt = torch.optim.Adam(tc.parameters(), lr=CONFIG["TC_LR"]); N = x_in.shape[0]
-    var = (y_out - y_out.mean(0)).pow(2).mean().clamp_min(1e-8); loss = torch.tensor(0.0)
+    torch.manual_seed(seed); tc.b_pre.data = x_tr.mean(0).detach(); tc.dec.bias.data = y_tr.mean(0).detach()
+    opt = torch.optim.Adam(tc.parameters(), lr=CONFIG["TC_LR"]); N = x_tr.shape[0]
     for _ in range(CONFIG["TC_STEPS"]):
-        ix = torch.randint(0, N, (min(CONFIG["TC_BATCH"], N),), device=x_in.device)
-        a = tc.encode(x_in[ix]); yr = tc.decode(a); loss = ((yr - y_out[ix]) ** 2).mean()
-        opt.zero_grad(); loss.backward(); opt.step()
-    tc.requires_grad_(False); return tc, float((loss / var).detach()), m   # recon as a fraction of output variance
+        ix = torch.randint(0, N, (min(CONFIG["TC_BATCH"], N),), device=x_tr.device)
+        a = tc.encode(x_tr[ix]); loss = ((tc.decode(a) - y_tr[ix]) ** 2).mean(); opt.zero_grad(); loss.backward(); opt.step()
+    tc.requires_grad_(False)
+    with torch.no_grad():                                  # HELD-OUT reconstruction (frac of EVAL output variance)
+        recon = float((((tc.decode(tc.encode(x_ev)) - y_ev) ** 2).mean() / (y_ev - y_ev.mean(0)).pow(2).mean().clamp_min(1e-8)).detach())
+    return tc, recon, m
 
 def _mlp_hook(module, inp, out):
     x = inp[0]
@@ -259,10 +269,11 @@ def _mlp_hook(module, inp, out):
     if a is not None: tc, leaf, err = a; return tc.decode(leaf) + err
     t = getattr(module, "_tc", None)                   # exact transcoder replacement: decode(encode(x))+err
     if t is not None: tc, err = t; return tc.decode(tc.encode(x)) + err
-    cf = getattr(module, "_cf", None)                  # counterfactual interchange patch carrying the error node
+    cf = getattr(module, "_cf", None)                  # constrained interchange patch: pin non-override features to base, carry error node
     if cf is not None:
-        tc, idx, src_f = cf; f = tc.encode(x); err = out - tc.decode(f)
-        L = min(f.shape[-2], src_f.shape[-2]); f[..., :L, idx] = src_f[..., :L, idx]; return tc.decode(f) + err
+        tc, idx, src, base = cf; fx = tc.encode(x); err = out - tc.decode(fx)
+        f = base.clone() if (base is not None and base.shape[-2] == fx.shape[-2]) else fx   # pin to base = no within-range re-encode leakage (mock falls back to re-encode)
+        L = min(f.shape[-2], src.shape[-2]); f[..., :L, idx] = src[..., :L, idx]; return tc.decode(f) + err
     if getattr(module, "_ablate", False):              # orientation-only mean ablation (report only)
         return out.mean(dim=tuple(range(out.dim()-1)), keepdim=True).expand_as(out)
     return None
@@ -287,15 +298,17 @@ print(f"transcoder + persistent hook on {len(HANDLES)} enc-MLP layers ready (mod
 
 # ============================================================
 def forecast_cf_multi(contexts, arm, n_samples, tcs):
-    '''arm: {layer: (feature_index_tensor, src_feature_cache)}. src is indexed to match the context slice.'''
+    '''arm: {layer: (idx, src, base)}. Constrained interchange: pin features to the run own base cache (no within-range re-encode leakage), override idx with src (the counterfactual), carry the error node.'''
     if IS_MOCK:
         clear_hooks()
-        for l, (idx, src) in arm.items(): MLP_MODS["enc_mlp"][l]._cf = (tcs[l], idx, src.to(DEVICE, dtype=DTYPE))
+        for l, (idx, src, base) in arm.items():
+            MLP_MODS["enc_mlp"][l]._cf = (tcs[l], idx, src.to(DEVICE, dtype=DTYPE), None if base is None else base.to(DEVICE, dtype=DTYPE))
         out = forecast_raw(contexts, n_samples); clear_hooks(); return out
     bs = int(CONFIG.get("FORECAST_BATCH", 4)); outs = []; i = 0
     while i < len(contexts):                                  # own the batching so the _cf src never desyncs from the chunk
         j = min(i + bs, len(contexts)); clear_hooks()
-        for l, (idx, src) in arm.items(): MLP_MODS["enc_mlp"][l]._cf = (tcs[l], idx, src[i:j].to(DEVICE, dtype=DTYPE))
+        for l, (idx, src, base) in arm.items():
+            MLP_MODS["enc_mlp"][l]._cf = (tcs[l], idx, src[i:j].to(DEVICE, dtype=DTYPE), None if base is None else base[i:j].to(DEVICE, dtype=DTYPE))
         try:
             chunk = [torch.tensor(np.asarray(c), dtype=DTYPE) for c in contexts[i:j]]
             with torch.inference_mode(): fc = PIPE.predict(chunk, prediction_length=CONFIG["PRED"], num_samples=n_samples)
@@ -354,15 +367,25 @@ def validate_local_replacement(contexts, tcs, layers):
 print("local replacement model (frozen attention + frozen norms + error node) ready")
 
 # ============================================================
-def _logit_readout(out, tids):
-    '''Linear functional of the logits (sum of teacher-forced target-token logits); exactly linear under the freeze,
-    so its gradient w.r.t. a feature leaf IS the virtual weight. The changepoint logit-difference analog.'''
-    lg = out.logits.float(); m = (tids != -100).float()
-    picked = lg.gather(-1, tids.clamp_min(0).unsqueeze(-1)).squeeze(-1)
-    return (picked * m).sum()
+if IS_MOCK:
+    CENTERS = torch.arange(VOCAB, dtype=torch.float32, device=DEVICE)        # mock: token id as a linear level proxy
+else:
+    _cen = getattr(PIPE.tokenizer, "centers", None)
+    if _cen is not None:
+        _cen = _cen.detach().float().flatten(); _full = torch.zeros(VOCAB); _ns = max(0, VOCAB - _cen.numel())
+        _full[_ns:_ns + _cen.numel()] = _cen[: VOCAB - _ns]; CENTERS = _full.to(DEVICE)   # quantizer bin centers, aligned to token ids
+    else: CENTERS = torch.arange(VOCAB, dtype=torch.float32, device=DEVICE)
+def _level_readout(out, tids):
+    '''Expected forecast LEVEL (softmax-weighted bin centers) summed over post-shift positions; the quantity
+    changepoint_recovery is built on, so the gold ranking is aligned with the metric. Uses torch.softmax (NOT the
+    frozen F.softmax), so the readout keeps its gradient while the model body stays frozen: a metric-aligned
+    FIRST-ORDER attribution in the frozen-attention replacement, not an exactly-linear virtual weight.'''
+    lg = out.logits.float(); p = torch.softmax(lg, dim=-1)
+    lvl = (p * CENTERS.view(1, 1, -1)).sum(-1); m = (tids != -100).float()
+    return (lvl * m).sum()
 def _attr_grads(layers, tcs, cc, tgt, metas, leaves_value, frozen, steps):
-    '''Accumulate d(readout)/d(leaf). Gold (frozen) uses the LINEAR logit readout so the gradient is the exact virtual
-    weight; EAP-IG (unfrozen) integrates -loss through the nonlinear model. Returns {l: grad tensor like Fc[l]}.'''
+    '''Accumulate d(readout)/d(leaf). Gold (frozen) uses the metric-aligned expected-level readout (first-order in the
+    frozen-attention replacement); EAP-IG (unfrozen) integrates -loss through the nonlinear model. Returns {l: grad}.'''
     n = len(cc); ids, am, scale = _tok_scale(cc); tids = _target_tokens(tgt, scale)
     inp_c, out_c = capture_io(layers, cc)
     Fc = {l: tcs[l].encode(inp_c[l]).detach() for l in layers}
@@ -380,7 +403,7 @@ def _attr_grads(layers, tcs, cc, tgt, metas, leaves_value, frozen, steps):
             ctx = frozen_model() if frozen else contextlib.nullcontext()
             with ctx, torch.enable_grad():
                 out = INNER(input_ids=ids[sl], attention_mask=am[sl], labels=tids[sl])
-                readout = _logit_readout(out, tids[sl]) if frozen else -out.loss
+                readout = _level_readout(out, tids[sl]) if frozen else -out.loss
                 readout.backward()
             for l in layers:
                 if leaves[l].grad is not None: accum[l][sl] += leaves[l].grad.detach()
@@ -446,7 +469,7 @@ def build_attr_graph(layers, tcs, cc, co, tgt, metas, label, cf=True):
     for l in layers:
         MLP_MODS["enc_mlp"][l]._attr = (tcs[l], leaves[l], err_leaf[l]); phs.append(MLP_MODS["enc_mlp"][l].register_forward_hook(cap_pre(l)))
     with frozen_model(), torch.enable_grad():
-        out = INNER(input_ids=ids, attention_mask=am, labels=tids); readout = _logit_readout(out, tids)   # LINEAR readout (exact virtual weight)
+        out = INNER(input_ids=ids, attention_mask=am, labels=tids); readout = _level_readout(out, tids)   # metric-aligned expected-level readout
     for h in phs: h.remove(); clear_hooks()
     og_feat = torch.autograd.grad(readout, [leaves[l] for l in layers], retain_graph=True, allow_unused=True)
     og_err = torch.autograd.grad(readout, [err_leaf[l] for l in layers], retain_graph=True, allow_unused=True)
@@ -530,19 +553,26 @@ print("Orientation (full-band)..." + MOCK_TAG); ORIENT = orient(); LAYERS = ORIE
 # ============================================================
 _rng = np.random.default_rng(CONFIG["SEED0"] + 21)
 CC, CO, TG, MT = make_cf_battery(_rng, CONFIG["N_PAIRS"], *CONFIG["DELTA_PRIMARY"])
-def train_band_transcoders(cc, co, mult, seedoff):
-    '''Transcoders on (MLP input, MLP output) pairs captured on the counterfactual battery (clean + corrupt).'''
-    inp_c, out_c = capture_io(LAYERS, cc); inp_o, out_o = capture_io(LAYERS, co)
+def train_band_transcoders(tr_cc, tr_co, ev_cc, ev_co, mult, seedoff):
+    '''Train on a SEPARATE corpus (tr); report HELD-OUT reconstruction on the eval battery (ev) so features cannot be fit to the eval set.'''
+    ti_c, to_c = capture_io(LAYERS, tr_cc); ti_o, to_o = capture_io(LAYERS, tr_co)
+    ei_c, eo_c = capture_io(LAYERS, ev_cc); ei_o, eo_o = capture_io(LAYERS, ev_co)
     tcs, recon = {}, {}
     for l in LAYERS:
-        xin = torch.cat([inp_c[l].reshape(-1, D_MODEL), inp_o[l].reshape(-1, D_MODEL)], 0)
-        yout = torch.cat([out_c[l].reshape(-1, D_MODEL), out_o[l].reshape(-1, D_MODEL)], 0)
-        tc, rl, nf = train_transcoder(xin, yout, mult * D_MODEL, CONFIG["SEED0"] + l + seedoff)
+        xtr = torch.cat([ti_c[l].reshape(-1, D_MODEL), ti_o[l].reshape(-1, D_MODEL)], 0)
+        ytr = torch.cat([to_c[l].reshape(-1, D_MODEL), to_o[l].reshape(-1, D_MODEL)], 0)
+        xev = torch.cat([ei_c[l].reshape(-1, D_MODEL), ei_o[l].reshape(-1, D_MODEL)], 0)
+        yev = torch.cat([eo_c[l].reshape(-1, D_MODEL), eo_o[l].reshape(-1, D_MODEL)], 0)
+        tc, rl, nf = train_transcoder(xtr, ytr, xev, yev, mult * D_MODEL, CONFIG["SEED0"] + l + seedoff)
         tcs[l] = tc; recon[l] = rl
     return tcs, recon, mult * D_MODEL
-TCS, RECON, NF = train_band_transcoders(CC, CO, CONFIG["TC_DICT_MULT"], 0)
+_rngt = np.random.default_rng(CONFIG["SEED0"] + 23)
+TRAIN_CC, TRAIN_CO, _, _ = make_cf_battery(_rngt, CONFIG["TRAIN_PAIRS"], *CONFIG["DELTA_PRIMARY"])
+_mtr_cc, _mtr_co, _, _ = make_motif_cf_battery(_rngt, max(2, CONFIG["TRAIN_PAIRS"] // 2))
+TRAIN_CC = list(TRAIN_CC) + list(_mtr_cc); TRAIN_CO = list(TRAIN_CO) + list(_mtr_co)   # separate corpus; recon is HELD-OUT on CC/CO
+TCS, RECON, NF = train_band_transcoders(TRAIN_CC, TRAIN_CO, CC, CO, CONFIG["TC_DICT_MULT"], 0)
 _bad = [l for l in LAYERS if RECON[l] > CONFIG["TC_RECON_MAX"]]
-print(f"  {len(LAYERS)} layers x {NF} features; recon(frac of out var) " + ",".join(f"L{l}:{RECON[l]:.3f}" for l in LAYERS))
+print(f"  {len(LAYERS)} layers x {NF} features; HELD-OUT recon(frac of eval out var) " + ",".join(f"L{l}:{RECON[l]:.3f}" for l in LAYERS))
 assert IS_MOCK or not _bad, f"transcoder recon exceeds TC_RECON_MAX={CONFIG['TC_RECON_MAX']} at {_bad}; raise TC_STEPS/TC_DICT_MULT"
 if _bad and IS_MOCK: print(f"  [mock] recon gate skipped (mock transcoder not interpretable); on pilot it would assert at {_bad}")
 # hard assert: local replacement (transcoders + error node + frozen attention/norms) matches the model on-prompt
@@ -551,26 +581,58 @@ assert _vr["rel"] < 1e-3, f"local replacement does not match underlying model on
 assert _vr["frozen_value_rel"] < 1e-4, f"freezing changed forward VALUES (should only affect gradients): rel {_vr['frozen_value_rel']:.2e}"
 print(f"  LOCAL REPLACEMENT matches model on-prompt (rel={_vr['rel']:.2e}); freeze preserves values (rel={_vr['frozen_value_rel']:.2e}); transcoder-only on-prompt rel={_vr['transcoder_only_rel']:.2f}  PASS" + MOCK_TAG)
 
+def _resample_pairs(cc, co, tg, mt, seed):
+    if seed == 0: return cc, co, tg, mt
+    rng = np.random.default_rng(CONFIG["SEED0"] + 500 + seed); ix = rng.integers(0, len(cc), len(cc))
+    return [cc[i] for i in ix], [co[i] for i in ix], tg[ix], [mt[i] for i in ix]
+def _interleave(*orders):
+    seen, out = set(), []
+    for tup in zip(*orders):
+        for j in tup:
+            if int(j) not in seen: seen.add(int(j)); out.append(int(j))
+    return out
 def build_ranking(tcs):
     g_gold, _, _, _ = direct_influence(LAYERS, tcs, CC, CO, TG, MT, frozen=True, steps=1)
     g_eap, _, _, _ = direct_influence(LAYERS, tcs, CC, CO, TG, MT, frozen=False, steps=CONFIG["EAP_STEPS"])
     g_prox = proxy_influence(LAYERS, tcs, CC, CO, MT)
-    flat_gold = np.concatenate([g_gold[l] for l in LAYERS]); flat_eap = np.concatenate([g_eap[l] for l in LAYERS])
-    flat_prox = np.concatenate([g_prox[l] for l in LAYERS])
+    flat_gold = np.concatenate([g_gold[l] for l in LAYERS]); flat_eap = np.concatenate([g_eap[l] for l in LAYERS]); flat_prox = np.concatenate([g_prox[l] for l in LAYERS])
     rc_ge = _spearman(flat_gold, flat_eap); rc_gp = _spearman(flat_gold, flat_prox)
-    graph = build_attr_graph(LAYERS, tcs, CC, CO, TG, MT, "change", cf=True)
-    # headline order: all-paths influence within the pruned top-F, then direct gold for the remainder
-    base = flat_gold if CONFIG["RANK_METHOD"] == "gold" else (flat_eap if CONFIG["RANK_METHOD"] == "eapig" else flat_prox)
-    order = list(np.argsort(-base))
+    # change graph + CONSERVATIVE CI across GRAPH_REBUILDS pair-resamples (captures the variance the fixed-A bootstrap misses)
+    graphs = [build_attr_graph(LAYERS, tcs, *_resample_pairs(CC, CO, TG, MT, rb), "change", cf=True) for rb in range(max(1, CONFIG["GRAPH_REBUILDS"]))]
+    graph = graphs[0]
+    if len(graphs) > 1:
+        rr = [g["replacement"] for g in graphs]; cm = [g["completeness"] for g in graphs]
+        graph["replacement_ci"] = [min(graph["replacement_ci"][0], min(rr)), max(graph["replacement_ci"][1], max(rr))]
+        graph["completeness_ci"] = [min(graph["completeness_ci"][0], min(cm)), max(graph["completeness_ci"][1], max(cm))]
+    graph["replacement_mde"] = float((graph["replacement_ci"][1] - graph["replacement_ci"][0]) / 2)
+    # headline order: counterfactual all-paths within the pruned top-F, then direct gold; UNION with EAP-IG when they disagree
+    gold_order = list(np.argsort(-flat_gold))
     if CONFIG["RANK_METHOD"] == "gold" and graph["n_nodes"]:
         topnodes = [graph["nodes"][i] for i in graph["order_nodes"]]; head = [LAYERS.index(int(l)) * NF + int(f) for l, f in topnodes]
-        rest = [j for j in order if j not in set(head)]; order = head + rest
-    print(f"  ranking = {CONFIG['RANK_METHOD'].upper()} over {len(LAYERS)*NF} (layer,feature) pairs; "
-          f"Spearman(gold,EAP-IG)={rc_ge:+.3f}  Spearman(gold,proxy)={rc_gp:+.3f}")
-    print(f"  attribution graph: {graph['n_nodes']} nodes ({CONFIG['ATTR_GRAPH_PAIRS']} pairs)  "
-          f"replacement={graph['replacement']:.2f} CI[{graph['replacement_ci'][0]:.2f},{graph['replacement_ci'][1]:.2f}]  "
-          f"completeness={graph['completeness']:.2f}  multihop_share={graph['multihop_share']:.2f}  spectral={graph['spectral']:.2f}")
-    return order, dict(gold_eap=rc_ge, gold_proxy=rc_gp), graph
+        gold_order = head + [j for j in gold_order if j not in set(head)]
+    eap_order = list(np.argsort(-flat_eap))
+    if rc_ge < CONFIG["RANK_AGREE_MIN"]:
+        order = _interleave(gold_order, eap_order); print(f"  [rank] gold and EAP-IG disagree (rho={rc_ge:+.2f} < {CONFIG['RANK_AGREE_MIN']}); UNIONING their orders so a mis-ranked causal feature still enters the union")
+    else:
+        order = [int(j) for j in gold_order]
+    # rank-vs-metric validation: exact single-feature denoising effect on the real metric vs the gold influence
+    rmc = float("nan")
+    try:
+        nval = min(CONFIG["ATTR_PAIRS"], len(CC)); ic, _ = capture_io(LAYERS, CC[:nval]); io, _ = capture_io(LAYERS, CO[:nval])
+        FCv = {l: tcs[l].encode(ic[l]).to("cpu", dtype=CACHE_DT) for l in LAYERS}; FCOv = {l: tcs[l].encode(io[l]).to("cpu", dtype=CACHE_DT) for l in LAYERS}
+        clear_hooks(); cb = float(cp_vec(forecast_raw(CO[:nval], CONFIG["N_CRPS_SAMPLES"]), MT[:nval]).mean()); ex, inf = [], []
+        for j in order[:min(8, len(order))]:
+            l = LAYERS[j // NF]; fi = int(j % NF)
+            arm1 = {l: (torch.as_tensor([fi], dtype=torch.long, device=DEVICE), FCv[l], FCOv[l])}   # inject one clean feature into the corrupt run
+            da = cp_vec(forecast_cf_multi(CO[:nval], arm1, CONFIG["N_CRPS_SAMPLES"], tcs), MT[:nval])
+            ex.append(float(da.mean() - cb)); inf.append(float(flat_gold[j]))
+        rmc = _spearman(inf, ex)
+    except Exception as e: print("  [rank] metric-validation skipped:", repr(e)[:80])
+    print(f"  ranking = {CONFIG['RANK_METHOD'].upper()} over {len(LAYERS)*NF} pairs; Spearman(gold,EAP)={rc_ge:+.3f} (gold,proxy)={rc_gp:+.3f}; gold-vs-EXACT-metric rho={rmc:+.2f}")
+    print(f"  attribution graph: {graph['n_nodes']} nodes ({CONFIG['ATTR_GRAPH_PAIRS']} pairs x {CONFIG['GRAPH_REBUILDS']} rebuilds)  "
+          f"replacement={graph['replacement']:.2f} CI[{graph['replacement_ci'][0]:.2f},{graph['replacement_ci'][1]:.2f}] MDE={graph['replacement_mde']:.2f}  "
+          f"completeness={graph['completeness']:.2f}  multihop_share={graph['multihop_share']:.2f}")
+    return order, dict(gold_eap=rc_ge, gold_proxy=rc_gp, gold_metric=rmc), graph
 ck = _load("rank")
 if ck is not None:
     ORDER = ck["order"]; RANK_CORR = ck["rank_corr"]; GRAPH_CHANGE = ck["graph"]; print("  [ckpt] ranking resumed")
@@ -586,31 +648,31 @@ _ids, _am = _tokenize(CC[:2]); _dec = torch.full((2, 1), DEC_START, dtype=torch.
 clear_hooks()
 with torch.inference_mode(): _g0 = INNER(input_ids=_ids, attention_mask=_am, decoder_input_ids=_dec).logits.clone()
 inp_o, _ = capture_io(LAYERS, CO[:2]); FCO2 = {l: TCS[l].encode(inp_o[l]) for l in LAYERS}
-for l in LAYERS: MLP_MODS["enc_mlp"][l]._cf = (TCS[l], torch.arange(NF, device=DEVICE), FCO2[l].to(DEVICE, dtype=DTYPE))
+for l in LAYERS: MLP_MODS["enc_mlp"][l]._cf = (TCS[l], torch.arange(NF, device=DEVICE), FCO2[l].to(DEVICE, dtype=DTYPE), None)
 with torch.inference_mode(): _g1 = INNER(input_ids=_ids, attention_mask=_am, decoder_input_ids=_dec).logits.clone()
 clear_hooks(); assert not torch.allclose(_g0, _g1), "multi-layer patch did not bite"
 print(f"  PLUMBING: multi-layer counterfactual patch bites (max|delta|={(_g0-_g1).abs().max():.4g})  PASS" + MOCK_TAG)
 
 # ============================================================
-def _complement_arm(per, src):
+def _complement_arm(per, src, base):
     arm = {}
     for l in LAYERS:
         mask = torch.ones(NF, dtype=torch.bool)
         if per[l]: mask[per[l]] = False
-        arm[l] = (mask.nonzero(as_tuple=True)[0].to(DEVICE), src[l])
+        arm[l] = (mask.nonzero(as_tuple=True)[0].to(DEVICE), src[l], base[l])
     return arm
-def _union_arm(per, src, end_layer=None):
-    return {l: (_idx_tensor(per[l]), src[l]) for l in LAYERS if per[l] and (end_layer is None or l <= end_layer)}
+def _union_arm(per, src, base, end_layer=None):
+    return {l: (_idx_tensor(per[l]), src[l], base[l]) for l in LAYERS if per[l] and (end_layer is None or l <= end_layer)}
 def _end_layers(per):
     used = [l for l in LAYERS if per[l]]
     if not used: return [LAYERS[-1]]
     lo, hi = used[0], used[-1]; ne = max(1, int(CONFIG["END_SWEEP"]))
     cand = sorted(set(int(round(lo + (hi - lo) * t / (ne - 1))) for t in range(ne)) if ne > 1 else {hi})
     return [l for l in LAYERS if l in cand] or [hi]
-def _sweep_union(contexts, per, src, metas, vecfn, tcs, reducer):
+def _sweep_union(contexts, per, src, base, metas, vecfn, tcs, reducer):
     vals = []
     for el in _end_layers(per):
-        arm = _union_arm(per, src, end_layer=el)
+        arm = _union_arm(per, src, base, end_layer=el)
         if not arm: continue
         vals.append(vecfn(forecast_cf_multi(contexts, arm, CONFIG["N_CRPS_SAMPLES"], tcs), metas))
     if not vals: return None
@@ -622,31 +684,37 @@ def run_curves():
     inp_c, _ = capture_io(LAYERS, CC); inp_o, _ = capture_io(LAYERS, CO)
     FC = {l: TCS[l].encode(inp_c[l]).to("cpu", dtype=CACHE_DT) for l in LAYERS}
     FCO = {l: TCS[l].encode(inp_o[l]).to("cpu", dtype=CACHE_DT) for l in LAYERS}
-    rngm = np.random.default_rng(CONFIG["SEED0"] + 44); mctx, mtg, mmeta = make_motif_battery(rngm, CONFIG["N_PAIRS"])
+    # selectivity control = a periodicity MINIMAL PAIR (period-present vs period-absent, shared noise), ablated by the
+    # SAME counterfactual interchange as change-detection (not mean ablation), so the comparison is like-for-like
+    rngm = np.random.default_rng(CONFIG["SEED0"] + 44); mctx, mco, mtg, mmeta = make_motif_cf_battery(rngm, CONFIG["N_PAIRS"])
     clear_hooks(); mbase = motif_vec(forecast_raw(mctx, CONFIG["N_CRPS_SAMPLES"]), mmeta)
-    inp_m, _ = capture_io(LAYERS, mctx); base_motif = {l: TCS[l].encode(inp_m[l]).mean(dim=(0,1), keepdim=True).expand(len(mctx), inp_m[l].shape[1], -1).to(CACHE_DT) for l in LAYERS}
+    inp_m, _ = capture_io(LAYERS, mctx); inp_mo, _ = capture_io(LAYERS, mco)
+    FM = {l: TCS[l].encode(inp_m[l]).to("cpu", dtype=CACHE_DT) for l in LAYERS}
+    FMO = {l: TCS[l].encode(inp_mo[l]).to("cpu", dtype=CACHE_DT) for l in LAYERS}
     KMAX = len(ORDER); rng = np.random.default_rng(CONFIG["SEED0"] + 77)
     rows = _load("curves") or []; done = {r["k"] for r in rows}
     for k in [kk for kk in CONFIG["K_GRID"] if kk <= KMAX]:
         if k in done: print(f"    [ckpt] k={k} resumed"); continue
         per = split_union(ORDER, k)
-        fa = cp_vec(forecast_cf_multi(CC, _complement_arm(per, FCO), CONFIG["N_CRPS_SAMPLES"], TCS), MT); fa_m, fa_ci = mean_ci(fa)
-        # completeness: union ablation toward corrupt, layer-range constrained, max over the end-layer sweep
-        ca = _sweep_union(CC, per, FCO, MT, cp_vec, TCS, lambda vs: min(vs, key=lambda v: v.mean()))
+        # faithfulness: keep union clean (base = clean FC), ablate the complement to corrupt (src = FCO)
+        fa = cp_vec(forecast_cf_multi(CC, _complement_arm(per, FCO, FC), CONFIG["N_CRPS_SAMPLES"], TCS), MT); fa_m, fa_ci = mean_ci(fa)
+        # completeness: ablate the union to corrupt (src=FCO) on the clean run (base=FC), constrained, max collapse over end-layer sweep
+        ca = _sweep_union(CC, per, FCO, FC, MT, cp_vec, TCS, lambda vs: min(vs, key=lambda v: v.mean()))
         cp_drop, cp_ci = mean_ci(base - (ca if ca is not None else base))
-        ma = _sweep_union(mctx, per, base_motif, mmeta, motif_vec, TCS, lambda vs: min(vs, key=lambda v: v.mean()))
+        # selectivity: interchange-ablate the union on the periodicity minimal pair (period-present -> period-absent)
+        ma = _sweep_union(mctx, per, FMO, FM, mmeta, motif_vec, TCS, lambda vs: min(vs, key=lambda v: v.mean()))
         mot_drop = float((mbase - (ma if ma is not None else mbase)).mean())
-        # sufficiency: inject clean union into corrupt, end-layer sweep, max gain
-        da = _sweep_union(CO, per, FC, MT, cp_vec, TCS, lambda vs: max(vs, key=lambda v: v.mean()))
+        # sufficiency: inject the clean union into the corrupt run (src=FC) on base=FCO, max gain over end-layer sweep
+        da = _sweep_union(CO, per, FC, FCO, MT, cp_vec, TCS, lambda vs: max(vs, key=lambda v: v.mean()))
         suf_m, suf_ci = mean_ci(da if da is not None else corr_base)
         fa_null, cp_null, suf_null = [], [], []
         for _ in range(CONFIG["N_RANDOM_NULL"]):
             rsel = rng.choice(KMAX, size=k, replace=False); rper = {l: [] for l in LAYERS}
             for j in rsel: rper[LAYERS[j // NF]].append(int(j % NF))
-            fa_null.append(float(cp_vec(forecast_cf_multi(CC, _complement_arm(rper, FCO), CONFIG["N_CRPS_SAMPLES"], TCS), MT).mean()))
-            rca = _sweep_union(CC, rper, FCO, MT, cp_vec, TCS, lambda vs: min(vs, key=lambda v: v.mean()))
+            fa_null.append(float(cp_vec(forecast_cf_multi(CC, _complement_arm(rper, FCO, FC), CONFIG["N_CRPS_SAMPLES"], TCS), MT).mean()))
+            rca = _sweep_union(CC, rper, FCO, FC, MT, cp_vec, TCS, lambda vs: min(vs, key=lambda v: v.mean()))
             cp_null.append(float((base - (rca if rca is not None else base)).mean()))
-            rda = _sweep_union(CO, rper, FC, MT, cp_vec, TCS, lambda vs: max(vs, key=lambda v: v.mean()))
+            rda = _sweep_union(CO, rper, FC, FCO, MT, cp_vec, TCS, lambda vs: max(vs, key=lambda v: v.mean()))
             suf_null.append(float((rda if rda is not None else corr_base).mean()))
         rows.append(dict(k=int(k), per_layer={int(l): len(per[l]) for l in LAYERS},
                          faith=fa_m, faith_ci=fa_ci, faith_frac=float(fa_m/(base.mean()+1e-6)), faith_null=float(np.mean(fa_null)),
@@ -661,12 +729,60 @@ def run_curves():
 print("Cross-layer union curves (layer-range patching, end-layer sweep)..." + MOCK_TAG); CURVES = run_curves()
 
 # ============================================================
+@contextlib.contextmanager
+def _enc_pattern(store, inject):
+    '''Capture (inject=False) or substitute (inject=True) the encoder self-attention patterns, identified as the first
+    N_ENC_LAYERS square (S x S) softmax calls of one forward (no chunking, so the layer counter stays aligned).
+    Patches the PATTERN only, isolating the QK circuit from the OV/value path.'''
+    cnt = {"i": 0}; _soft = F.softmax
+    def soft(x, *a, **k):
+        p = _soft(x, *a, **k)
+        if p.dim() == 4 and p.shape[-2] == p.shape[-1] and cnt["i"] < N_ENC_LAYERS:
+            i = cnt["i"]; cnt["i"] += 1
+            if inject:
+                if i < len(store) and store[i] is not None and store[i].shape == p.shape: return store[i].to(p.device, p.dtype)
+            else:
+                while len(store) <= i: store.append(None)
+                store[i] = p.detach().to("cpu", torch.float16)
+        return p
+    F.softmax = soft
+    try: yield
+    finally: F.softmax = _soft
+def forecast_pattern(contexts, store, inject, n_samples):
+    '''One un-chunked forward so the pattern counter stays aligned across capture and inject.'''
+    clear_hooks()
+    if IS_MOCK:
+        with _enc_pattern(store, inject): return forecast_raw(contexts, n_samples)
+    chunk = [torch.tensor(np.asarray(c), dtype=DTYPE) for c in contexts]
+    with _enc_pattern(store, inject), torch.inference_mode():
+        fc = PIPE.predict(chunk, prediction_length=CONFIG["PRED"], num_samples=n_samples)
+    return fc.detach().cpu().numpy()
+def attention_pattern_test():
+    ck = _load("attn")
+    if ck is not None: print("  [ckpt] attention-pattern test resumed"); return ck
+    rng = np.random.default_rng(CONFIG["SEED0"] + 131); cc, co, tg, mt = make_cf_battery(rng, CONFIG["PATTERN_PAIRS"], *CONFIG["DELTA_PRIMARY"])
+    ns = CONFIG["PATTERN_SAMPLES"]; sc, so = [], []
+    base_clean = cp_vec(forecast_pattern(cc, sc, False, ns), mt)      # capture clean patterns -> sc
+    base_corr = cp_vec(forecast_pattern(co, so, False, ns), mt)       # capture corrupt patterns -> so
+    den = cp_vec(forecast_pattern(co, sc, True, ns), mt)              # corrupt values + CLEAN pattern: does the pattern induce recovery?
+    noi = cp_vec(forecast_pattern(cc, so, True, ns), mt)              # clean values + CORRUPT pattern: does removing the pattern destroy recovery?
+    res = dict(base_clean=float(base_clean.mean()), base_corr=float(base_corr.mean()),
+               pattern_denoise=float(den.mean()), pattern_noise=float(noi.mean()),
+               pat_denoise_gain=float(den.mean() - base_corr.mean()), pat_noise_drop=float(base_clean.mean() - noi.mean()))
+    print(f"  base clean={res['base_clean']:.2f} corrupt={res['base_corr']:.2f}")
+    print(f"  PATTERN denoise (corrupt values + clean pattern)={res['pattern_denoise']:.2f}  gain={res['pat_denoise_gain']:+.3f}")
+    print(f"  PATTERN noise   (clean values + corrupt pattern)={res['pattern_noise']:.2f}  drop={res['pat_noise_drop']:+.3f}")
+    print("  reading: pattern gain >> feature denoise gain => QK-routed; both near 0 => distributed or transcoder-missed.")
+    _save("attn", res); return res
+print("Attention-pattern interchange (QK-vs-feature causal test)..." + MOCK_TAG); ATTN = attention_pattern_test()
+
+# ============================================================
 def snr_sweep():
     out = _load("snr") or []; done = {tuple(r["delta"]) for r in out}
     for (dl, dh) in CONFIG["SNR_DELTAS"]:
         if (dl, dh) in done: print(f"    [ckpt] snr delta[{dl},{dh}] resumed"); continue
         rng = np.random.default_rng(CONFIG["SEED0"] + 66 + int(dl * 100)); cc, co, tg, mt = make_cf_battery(rng, CONFIG["SNR_PAIRS"], dl, dh)
-        tcs, recon, _nf = train_band_transcoders(cc, co, CONFIG["TC_DICT_MULT"], int(dl * 100))
+        tcs, recon, _nf = train_band_transcoders(cc, co, cc, co, CONFIG["TC_DICT_MULT"], int(dl * 100))
         g, _, _, _ = direct_influence(LAYERS, tcs, cc, co, tg, mt, frozen=True, steps=1)
         order = list(np.argsort(-np.concatenate([g[l] for l in LAYERS])))
         inp_c, _ = capture_io(LAYERS, cc); inp_o, _ = capture_io(LAYERS, co)
@@ -680,7 +796,7 @@ def snr_sweep():
             for l in LAYERS:
                 mask = torch.ones(NF, dtype=torch.bool)
                 if per[l]: mask[per[l]] = False
-                arm[l] = (mask.nonzero(as_tuple=True)[0].to(DEVICE), fco[l])
+                arm[l] = (mask.nonzero(as_tuple=True)[0].to(DEVICE), fco[l], fc[l])
             fr.append([int(k), float(cp_vec(forecast_cf_multi(cc, arm, CONFIG["N_CRPS_SAMPLES"], tcs), mt).mean()) / (base.mean() + 1e-6)])
         out.append(dict(delta=[dl, dh], clean_recovery=float(base.mean()), faith_frac_by_k=fr)); _save("snr", out)
         print(f"    delta[{dl},{dh}] clean_rec={base.mean():.2f}  faith_frac " + " ".join(f"k{k}:{v:.2f}" for k, v in fr))
@@ -694,7 +810,7 @@ def feature_splitting():
     inp_c, _ = capture_io(LAYERS, CC); inp_o, _ = capture_io(LAYERS, CO)
     res = {}
     for tag, mult in [("small", CONFIG["TC_DICT_MULT_SMALL"]), ("primary", CONFIG["TC_DICT_MULT"])]:
-        tcs, recon, nf = train_band_transcoders(CC, CO, mult, 1000 + mult)
+        tcs, recon, nf = train_band_transcoders(CC, CO, CC, CO, mult, 1000 + mult)
         g, _, _, _ = direct_influence(LAYERS, tcs, CC, CO, TG, MT, frozen=True, steps=1)
         order = list(np.argsort(-np.concatenate([g[l] for l in LAYERS])))
         fc = {l: tcs[l].encode(inp_c[l]).to("cpu", dtype=CACHE_DT) for l in LAYERS}
@@ -708,7 +824,7 @@ def feature_splitting():
             for l in LAYERS:
                 mask = torch.ones(nf, dtype=torch.bool)
                 if per[l]: mask[per[l]] = False
-                arm[l] = (mask.nonzero(as_tuple=True)[0].to(DEVICE), fco[l])
+                arm[l] = (mask.nonzero(as_tuple=True)[0].to(DEVICE), fco[l], fc[l])
             faith[int(k)] = float(cp_vec(forecast_cf_multi(CC, arm, CONFIG["N_CRPS_SAMPLES"], tcs), MT).mean()) / (base + 1e-6)
         # union size to reach FAITH_TARGET (smaller dict concentrating the effect = splitting in the bigger one)
         kstar = next((k for k in sorted(faith) if faith[k] >= CONFIG["FAITH_TARGET"]), None)
@@ -725,7 +841,7 @@ def asymmetry():
     ck = _load("asym")
     if ck is not None: print("  [ckpt] asymmetry resumed"); return ck
     rngm = np.random.default_rng(CONFIG["SEED0"] + 91); mctx, mtg, mmeta = make_motif_battery(rngm, max(CONFIG["ATTR_PAIRS"], CONFIG["N_PAIRS"]))
-    tcs_m, recon_m, _nf = train_band_transcoders(mctx, mctx, CONFIG["TC_DICT_MULT"], 2000)   # transcoders on motif activations
+    tcs_m, recon_m, _nf = train_band_transcoders(mctx, mctx, mctx, mctx, CONFIG["TC_DICT_MULT"], 2000)   # transcoders on motif activations
     g_motif = build_attr_graph(LAYERS, tcs_m, mctx, mctx, mtg, mmeta, "periodicity", cf=False)
     # periodicity has no minimal-pair corrupt, so it can only be CLEAN-weighted. For a LIKE-FOR-LIKE comparison we also
     # build a clean-weighted change graph; the cf=True GRAPH_CHANGE stays the causal one for the verdict high_frac gate.
@@ -766,14 +882,25 @@ def summarize():
         if not faith_beats: why.append("faithfulness ties the random-union null (layers bypassable)")
         if not sufficient: why.append("not sufficient under denoising")
         if not selective: why.append("not motif-selective")
-        if not high_frac: why.append(f"features explain only {repl:.0%} (error dark-matter dominates)")
-        agap = ASYM["replacement_gap"]   # periodicity minus change, clean-weighted (like-for-like)
-        asym_txt = ((f"the like-for-like attention asymmetry (clean-weighted replacement periodicity {ASYM['periodicity']['replacement']:.2f} > "
-                     f"change {ASYM['change']['replacement']:.2f}) locates the likely crux on the frozen QK side") if agap > 0.05 else
-                    (f"the change ({ASYM['change']['replacement']:.2f}) and periodicity ({ASYM['periodicity']['replacement']:.2f}) graphs are "
-                     f"comparably feature-mediated (gap {agap:+.2f}), so the QK-crux reading is not supported by this run"))
-        verdict = (f"B: DISTRIBUTED across layers too ({'; '.join(why)}); no small cross-layer feature circuit; "
-                   f"SAE-vs-circuit discrepancy CLOSED at every granularity; {asym_txt}")
+        if not high_frac: why.append(f"features explain only {repl:.0%} (replacement CI lo {repl_ci[0]:.2f} < 0.5)")
+        # DECOMPOSE B via the attention-pattern interchange (causal QK-vs-feature) and the held-out recon (three hypotheses)
+        feat_gain = max((r["gain"] for r in R), default=0.0); pat_gain = ATTN["pat_denoise_gain"]
+        mean_recon = float(np.mean([RECON[l] for l in LAYERS])); err_share = 1.0 - GRAPH_CHANGE["completeness"]
+        if pat_gain >= CONFIG["SUFFICIENCY_BAR"] and pat_gain > feat_gain + 0.05:
+            decomp = (f"ATTENTION-ROUTED (QK): patching the attention PATTERN alone induces recovery (gain {pat_gain:+.2f}) while the "
+                      f"feature union does not (gain {feat_gain:+.2f}); the crux is the frozen QK circuit, so B is bankable as attention-routed")
+        elif mean_recon > CONFIG["TC_RECON_MAX"] or err_share > 0.6:
+            decomp = (f"DISTRIBUTED-OR-UNRECONSTRUCTED: neither the feature union (gain {feat_gain:+.2f}) nor the attention pattern "
+                      f"(gain {pat_gain:+.2f}) induces recovery, and the transcoders leave {err_share:.0%} of the influence in the error node "
+                      f"(held-out recon {mean_recon:.2f} > {CONFIG['TC_RECON_MAX']}); the computation may be in the unreconstructed residual")
+        else:
+            decomp = (f"GENUINELY DISTRIBUTED: neither the feature union (gain {feat_gain:+.2f}) nor the attention pattern (gain {pat_gain:+.2f}) "
+                      f"induces recovery and the transcoders reconstruct well (held-out recon {mean_recon:.2f}, error share {err_share:.0%}); the "
+                      f"computation is spread, not a small cross-layer set nor the QK pattern")
+        agap = ASYM["replacement_gap"]
+        asym_txt = ((f"the like-for-like representational asymmetry agrees (periodicity {ASYM['periodicity']['replacement']:.2f} > change {ASYM['change']['replacement']:.2f})") if agap > 0.05
+                    else (f"the like-for-like representational asymmetry is inconclusive (periodicity {ASYM['periodicity']['replacement']:.2f} vs change {ASYM['change']['replacement']:.2f}, gap {agap:+.2f})"))
+        verdict = (f"B: NOT a small cross-layer feature circuit ({'; '.join(why)}); {decomp}; {asym_txt}")
     mde = float(np.mean([abs(r["faith_ci"][1]-r["faith_ci"][0]) for r in R]) / 2) if R else float("nan")
     print("=" * 100); print(f"PHASE 5 v4 VERDICT: {verdict}{MOCK_TAG}"); print("=" * 100)
     print(f"  clean recovery={base:.3f}  ranking={CONFIG['RANK_METHOD'].upper()} (Spearman gold-vs-EAP {RANK_CORR['gold_eap']:+.2f}, gold-vs-proxy {RANK_CORR['gold_proxy']:+.2f})  "
@@ -782,6 +909,8 @@ def summarize():
     print(f"  replacement (change)={repl:.2f} CI[{repl_ci[0]:.2f},{repl_ci[1]:.2f}]  completeness={GRAPH_CHANGE['completeness']:.2f} CI[{GRAPH_CHANGE['completeness_ci'][0]:.2f},{GRAPH_CHANGE['completeness_ci'][1]:.2f}]  multihop_share={GRAPH_CHANGE['multihop_share']:.2f}  CLT-escalation-signature={escalate_clt}")
     print(f"  max denoising gain={max(r['gain'] for r in R):+.4f} (bar {CONFIG['SUFFICIENCY_BAR']})  max completeness={max(r['cp_complete'] for r in R):+.4f}  SNR small-k sharpens toward floor={snr_sharpens}")
     print(f"  feature-splitting={SPLIT['splitting']}  attention-asymmetry replacement gap (periodicity - change)={ASYM['replacement_gap']:+.2f}")
+    print(f"  ATTENTION-PATTERN interchange: pattern denoise gain={ATTN['pat_denoise_gain']:+.3f}  pattern noise drop={ATTN['pat_noise_drop']:+.3f}  (vs best feature denoise gain {max((r['gain'] for r in R), default=0.0):+.3f})")
+    print(f"  replacement MDE={GRAPH_CHANGE.get('replacement_mde', float('nan')):.2f}  gold-vs-EXACT-metric rho={RANK_CORR.get('gold_metric', float('nan')):+.2f}  held-out recon(mean)={float(np.mean([RECON[l] for l in LAYERS])):.2f}")
     print(f"  DETECTION POWER: min detectable effect ~{mde:.3f} -> " + ("positive result is real." if localized else "a localized cross-layer circuit WOULD have been resolved; the distributed verdict is de-confounded, not underpowered."))
     return dict(verdict=verdict, localized=bool(localized), kstar=kstar, small=bool(small), faith_beats=bool(faith_beats),
                 selective=bool(selective), complete_beats=bool(complete_beats), sufficient=bool(sufficient),
@@ -790,7 +919,9 @@ def summarize():
                 escalate_clt=escalate_clt, snr_sharpens=bool(snr_sharpens), splitting=bool(SPLIT["splitting"]),
                 rank_method=CONFIG["RANK_METHOD"], rank_corr=RANK_CORR, layers=LAYERS, depths=[rel_depth(l) for l in LAYERS],
                 mishra_in_band=in_band, n_features=int(NF), recon={int(l): RECON[l] for l in LAYERS}, min_detectable=mde,
-                asym_replacement_gap=float(ASYM["replacement_gap"]))
+                asym_replacement_gap=float(ASYM["replacement_gap"]), replacement_mde=float(GRAPH_CHANGE.get("replacement_mde", float("nan"))),
+                rank_metric_corr=float(RANK_CORR.get("gold_metric", float("nan"))), held_out_recon=float(np.mean([RECON[l] for l in LAYERS])),
+                pattern_denoise_gain=float(ATTN["pat_denoise_gain"]), pattern_noise_drop=float(ATTN["pat_noise_drop"]))
 SUMMARY = summarize()
 
 # ============================================================
@@ -807,7 +938,9 @@ try:
     b.plot(ks, [r["cp_null_p95"] for r in R], "x:", color="#999", label="complete null p95")
     b.plot(ks, [r["gain"] for r in R], "s-", color="#27ae60", label="denoising gain")
     b.plot(ks, [r["motif_drop"] for r in R], "^--", color="#7f8c8d", label="motif drop")
-    b.axhline(CONFIG["SUFFICIENCY_BAR"], color="green", ls=":", lw=1, label="sufficiency bar"); b.set_xscale("log", base=2)
+    b.axhline(CONFIG["SUFFICIENCY_BAR"], color="green", ls=":", lw=1, label="sufficiency bar")
+    b.axhline(ATTN["pat_denoise_gain"], color="purple", ls="-.", lw=1.2, label="attn-pattern denoise gain")
+    b.set_xscale("log", base=2)
     b.set_xlabel("union size k"); b.set_ylabel("rel-collapse / gain"); b.legend(fontsize=7); b.set_title("Fig 7b: completeness + denoising (CIs)", fontsize=9)
     c = ax[1, 0]
     for r in SNR:
@@ -830,7 +963,7 @@ except Exception as e:
     import traceback; print("fig skipped:", repr(e)[:160]); traceback.print_exc()
 
 # ============================================================
-out = dict(summary=SUMMARY, orientation=ORIENT, delta_monotone=MONO, curves=CURVES, snr=SNR, split=SPLIT,
+out = dict(summary=SUMMARY, orientation=ORIENT, delta_monotone=MONO, attention_pattern=ATTN, curves=CURVES, snr=SNR, split=SPLIT,
            asymmetry=dict(replacement_gap=ASYM["replacement_gap"], multihop_gap=ASYM["multihop_gap"], basis=ASYM.get("basis", "clean"),
                           change={k: ASYM["change"][k] for k in ("label","cf","replacement","replacement_ci","completeness","multihop_share","n_nodes","spectral")},
                           periodicity={k: ASYM["periodicity"][k] for k in ("label","cf","replacement","replacement_ci","completeness","multihop_share","n_nodes","spectral")}),
