@@ -389,7 +389,7 @@ def capture_io(layers, contexts):
             return cap
         hs.append(m.register_forward_hook(mk(l)))
     clear_hooks()
-    with torch.inference_mode(): INNER.get_encoder()(input_ids=ids, attention_mask=am)
+    with torch.no_grad(): INNER.get_encoder()(input_ids=ids, attention_mask=am)   # no_grad (NOT inference_mode): outputs feed the attribution autograd graph as constants
     for h in hs: h.remove()
     return {l: store[l][0] for l in layers}, {l: store[l][1] for l in layers}
 print(f"transcoder + persistent hook on {len(HANDLES)} enc-MLP layers ready (modes: _tc, _attr, _cf, _ablate)")
