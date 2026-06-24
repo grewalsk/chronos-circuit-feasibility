@@ -651,6 +651,7 @@ def build_attr_graph(layers, tcs, cc, co, tgt, metas, label, cf=True):
     A = np.zeros((F_, F_)); Aef = np.zeros((E_, F_))                          # feature->feature and error->feature edges
     for ti, (lt, ft) in enumerate(nodes):
         scal = torch.stack([preacts[lt][j, taus[j]:CTX, ft].sum() for j in range(n)]).sum()
+        if not scal.requires_grad: continue   # target preact has no upstream band-leaf dependency (e.g. the first band layer): its A column is correctly 0
         gs = torch.autograd.grad(scal, [leaves[l] for l in layers] + [err_leaf[l] for l in layers], retain_graph=True, allow_unused=True)
         for si, (ls, fs) in enumerate(nodes):
             if ls >= lt: continue
