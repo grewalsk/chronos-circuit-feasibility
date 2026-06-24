@@ -84,7 +84,7 @@ CONFIG = {
     "TC_RECON_MAX": 0.25,                # HELD-OUT recon gate (frac of eval MLP-output variance); a poor transcoder voids the result
     # ---- attribution: linear virtual weights (gold) + all-paths influence; EAP-IG and proxy as cross-checks ----
     "RANK_METHOD": "gold",               # "gold" (frozen-attn linear virtual weight, all-paths) | "eapig" | "proxy"
-    "ATTR_PAIRS": 12, "ATTR_BATCH": 2, "ATTR_TOPF": 96, "ATTR_GRAPH_PAIRS": 32, "GRAPH_BOOTSTRAP": 200, "GRAPH_REBUILDS": 3, "RANK_AGREE_MIN": 0.5, "EAP_STEPS": 4,   # ATTR_TOPF = node cap for the explicit A
+    "ATTR_PAIRS": 12, "ATTR_BATCH": 2, "ATTR_TOPF": 96, "ATTR_GRAPH_PAIRS": 16, "GRAPH_BOOTSTRAP": 200, "GRAPH_REBUILDS": 3, "RANK_AGREE_MIN": 0.5, "EAP_STEPS": 4,   # ATTR_TOPF = node cap for the explicit A
     # ---- faithfulness / completeness / selectivity / sufficiency over UNION size ----
     "K_GRID": [1, 2, 4, 8, 16, 32, 64, 128], "FAITH_TARGET": 0.60, "LOCALIZE_MAX_FEATURES": 32,
     "N_RANDOM_NULL": 32, "SELECTIVITY_MARGIN": 2.0, "FAITH_BEAT_MARGIN": 0.05, "SUFFICIENCY_BAR": 0.15,
@@ -661,6 +661,8 @@ def build_attr_graph(layers, tcs, cc, co, tgt, metas, label, cf=True):
             if le >= lt: continue
             gre = gs[E_ + e]
             if gre is not None: Aef[e, ti] = float(np.mean([float((gre[j, taus[j]:CTX, :] * werr[le][j, taus[j]:CTX, :]).sum()) for j in range(n)]))
+    if DEVICE == "cuda":                                                   # free the retained forward graph + full-NF leaf/err caches before the numpy section (OOM safety on Large)
+        del out, readout, preacts, leaves, err_leaf, og_feat, og_err; torch.cuda.empty_cache()
     spec = float(np.max(np.abs(np.linalg.eigvals(A)))) if F_ else 0.0
     scale_f = (0.9 / (spec + 1e-9)) if spec >= 0.9 else 1.0                   # signed operator; |A| spectral radius only guards convergence
     As = A * scale_f; Aef_s = Aef * scale_f; Binv = np.linalg.inv(np.eye(F_) - As); Bmat = Binv - np.eye(F_)
@@ -748,14 +750,27 @@ TRAIN_CC = list(TRAIN_CC) + list(_mtr_cc); TRAIN_CO = list(TRAIN_CO) + list(_mtr
 TCS, RECON, NF = train_band_transcoders(TRAIN_CC, TRAIN_CO, CC, CO, CONFIG["TC_DICT_MULT"], 0)
 _bad = [l for l in LAYERS if RECON[l] > CONFIG["TC_RECON_MAX"]]
 print(f"  {len(LAYERS)} layers x {NF} features; HELD-OUT recon(frac of eval out var) " + ",".join(f"L{l}:{RECON[l]:.3f}" for l in LAYERS))
-DROPPED_LAYERS = []
-if _bad and not IS_MOCK:                                 # a layer whose transcoder cannot reconstruct is untrustworthy: drop it, keep coverage where the substrate is valid
+DROPPED_LAYERS = []; _bandck = _load("band")
+if _bandck is not None and not IS_MOCK and len([l for l in LAYERS if l in set(_bandck.get("layers", []))]) >= 2:
+    keep = [l for l in LAYERS if l in set(_bandck["layers"])]; DROPPED_LAYERS = [l for l in LAYERS if l not in keep]   # RESUME: reuse the persisted kept band (deterministic; a re-derived drop could otherwise misalign the cached ORDER)
+    if DROPPED_LAYERS: print(f"  [ckpt] band resumed -> kept {keep}, dropped {DROPPED_LAYERS}")
+    LAYERS = keep; TCS = {l: TCS[l] for l in keep}; RECON = {l: RECON[l] for l in keep}
+elif _bad and not IS_MOCK:                               # a layer whose transcoder cannot reconstruct is untrustworthy: drop it, keep coverage where the substrate is valid
     keep = [l for l in LAYERS if l not in _bad]
     assert len(keep) >= 2, f"too few layers pass the recon gate (keep={keep}, failed={_bad} at TC_RECON_MAX={CONFIG['TC_RECON_MAX']}); raise TC_TOPK/TC_STEPS/TC_DICT_MULT or relax TC_RECON_MAX"
     print(f"  [recon gate] DROPPING {_bad} (held-out recon > {CONFIG['TC_RECON_MAX']}); analysis proceeds on the well-reconstructed band {keep} (still cross-layer), recorded in the verdict")
     DROPPED_LAYERS = list(_bad); LAYERS = keep; TCS = {l: TCS[l] for l in keep}; RECON = {l: RECON[l] for l in keep}
 elif _bad and IS_MOCK:
     print(f"  [mock] recon gate skipped (mock transcoder not interpretable); on pilot it would drop {_bad}")
+BAND_SIG = ",".join(str(int(l)) for l in LAYERS) + "|" + str(int(NF))   # signature: discard band-dependent checkpoints if the kept band or NF changed across a resume
+_save("band", {"layers": [int(l) for l in LAYERS], "dropped": [int(l) for l in DROPPED_LAYERS], "nf": int(NF)})
+def _load_sig(name):
+    ck = _load(name)
+    if ck is None: return None
+    if not (isinstance(ck, dict) and ck.get("sig") == BAND_SIG):
+        print(f"  [ckpt] {name} discarded (band/NF signature changed since it was written; recomputing)"); return None
+    return ck["obj"]
+def _save_sig(name, obj): _save(name, {"sig": BAND_SIG, "obj": obj})
 # hard assert: local replacement (transcoders + error node + frozen attention/norms) matches the model on-prompt
 _vr = validate_local_replacement(CC[:2], TCS, LAYERS)
 assert _vr["rel"] < 1e-3, f"local replacement does not match underlying model on-prompt (rel {_vr['rel']:.2e})"
@@ -780,6 +795,7 @@ def build_ranking(tcs):
     rc_ge = _spearman(flat_gold, flat_eap); rc_gp = _spearman(flat_gold, flat_prox)
     # change graph + CONSERVATIVE CI across GRAPH_REBUILDS pair-resamples (captures the variance the fixed-A bootstrap misses)
     graphs = [build_attr_graph(LAYERS, tcs, *_resample_pairs(CC, CO, TG, MT, rb), "change", cf=True) for rb in range(max(1, CONFIG["GRAPH_REBUILDS"]))]
+    if DEVICE == "cuda": torch.cuda.empty_cache()
     graph = graphs[0]
     if len(graphs) > 1:
         rr = [g["replacement"] for g in graphs]; cm = [g["completeness"] for g in graphs]
@@ -814,15 +830,17 @@ def build_ranking(tcs):
           f"replacement={graph['replacement']:.2f} CI[{graph['replacement_ci'][0]:.2f},{graph['replacement_ci'][1]:.2f}] MDE={graph['replacement_mde']:.2f}  "
           f"completeness={graph['completeness']:.2f}  multihop_share={graph['multihop_share']:.2f}")
     return order, dict(gold_eap=rc_ge, gold_proxy=rc_gp, gold_metric=rmc), graph
-ck = _load("rank")
+ck = _load_sig("rank")
 if ck is not None:
     ORDER = ck["order"]; RANK_CORR = ck["rank_corr"]; GRAPH_CHANGE = ck["graph"]; print("  [ckpt] ranking resumed")
 else:
     ORDER, RANK_CORR, GRAPH_CHANGE = build_ranking(TCS)
-    _save("rank", dict(order=[int(x) for x in ORDER], rank_corr=RANK_CORR, graph=GRAPH_CHANGE))
+    _save_sig("rank", dict(order=[int(x) for x in ORDER], rank_corr=RANK_CORR, graph=GRAPH_CHANGE))
 def split_union(order, k):
     per = {l: [] for l in LAYERS}
-    for j in order[:k]: per[LAYERS[j // NF]].append(int(j % NF))
+    for j in order[:k]:
+        if j // NF >= len(LAYERS): continue   # defensive: a stale index from a changed band (the signature guard should already have rebuilt)
+        per[LAYERS[j // NF]].append(int(j % NF))
     return per
 # PLUMBING: multi-layer counterfactual patch bites
 _ids, _am = _tokenize(CC[:2]); _dec = torch.full((2, 1), DEC_START, dtype=torch.long, device=DEVICE)
@@ -896,7 +914,7 @@ def run_curves():
     FMO = {l: TCS[l].encode(inp_mo[l]).to("cpu", dtype=CACHE_DT) for l in LAYERS}
     ERR_M = {l: (out_m[l] - TCS[l].decode(TCS[l].encode(inp_m[l]))).to("cpu", dtype=CACHE_DT) for l in LAYERS}
     KMAX = len(ORDER); rng = np.random.default_rng(CONFIG["SEED0"] + 77)
-    rows = _load("curves") or []; done = {r["k"] for r in rows}
+    rows = _load_sig("curves") or []; done = {r["k"] for r in rows}
     for k in [kk for kk in CONFIG["K_GRID"] if kk <= KMAX]:
         if k in done: print(f"    [ckpt] k={k} resumed"); continue
         per = split_union(ORDER, k)
@@ -925,7 +943,7 @@ def run_curves():
                          cp_complete=cp_drop, cp_ci=cp_ci, cp_null_p95=float(np.percentile(cp_null, 95)), motif_drop=mot_drop,
                          induced=suf_m, induced_ci=suf_ci, gain=float(suf_m - corr_base.mean()), suf_null_p95=float(np.percentile(suf_null, 95)),
                          selective=bool(cp_drop >= CONFIG["SELECTIVITY_MARGIN"] * max(mot_drop, 1e-6) and cp_drop > float(np.percentile(cp_null, 95)))))
-        _save("curves", rows)
+        _save_sig("curves", rows)
         print(f"    k={k:4d}  faith_frac={rows[-1]['faith_frac']:.2f}(null {rows[-1]['faith_null']/(base.mean()+1e-6):.2f})  "
               f"cp_complete={cp_drop:+.3f}  motif={mot_drop:+.3f}  denoise_gain={rows[-1]['gain']:+.3f}  sel={rows[-1]['selective']}")
     rows.sort(key=lambda r: r["k"])
@@ -1008,7 +1026,7 @@ print("Attention-pattern interchange (QK-vs-feature causal test)..." + MOCK_TAG)
 md("## 12. SNR sweep: re-rank with the gold attribution at each shift magnitude toward the noise floor")
 code(r"""
 def snr_sweep():
-    out = _load("snr") or []; done = {tuple(r["delta"]) for r in out}
+    out = _load_sig("snr") or []; done = {tuple(r["delta"]) for r in out}
     for (dl, dh) in CONFIG["SNR_DELTAS"]:
         if (dl, dh) in done: print(f"    [ckpt] snr delta[{dl},{dh}] resumed"); continue
         rng = np.random.default_rng(CONFIG["SEED0"] + 66 + int(dl * 100)); cc, co, tg, mt = make_cf_battery(rng, CONFIG["SNR_PAIRS"], dl, dh)
@@ -1029,7 +1047,7 @@ def snr_sweep():
                 if per[l]: mask[per[l]] = False
                 arm[l] = (mask.nonzero(as_tuple=True)[0].to(DEVICE), fco[l], fc[l], ec[l])
             fr.append([int(k), float(cp_vec(forecast_cf_multi(cc, arm, CONFIG["N_CRPS_SAMPLES"], tcs), mt).mean()) / (base.mean() + 1e-6)])
-        out.append(dict(delta=[dl, dh], clean_recovery=float(base.mean()), faith_frac_by_k=fr)); _save("snr", out)
+        out.append(dict(delta=[dl, dh], clean_recovery=float(base.mean()), faith_frac_by_k=fr)); _save_sig("snr", out)
         print(f"    delta[{dl},{dh}] clean_rec={base.mean():.2f}  faith_frac " + " ".join(f"k{k}:{v:.2f}" for k, v in fr))
     return out
 print("SNR sweep (gold re-rank per regime)..." + MOCK_TAG); SNR = snr_sweep()
@@ -1039,7 +1057,7 @@ print("SNR sweep (gold re-rank per regime)..." + MOCK_TAG); SNR = snr_sweep()
 md("## 13. Feature-splitting check: localization at two dictionary sizes (a split concept fakes 'distributed')")
 code(r"""
 def feature_splitting():
-    ck = _load("split")
+    ck = _load_sig("split")
     if ck is not None: print("  [ckpt] feature-splitting resumed"); return ck
     inp_c, out_c = capture_io(LAYERS, CC); inp_o, _ = capture_io(LAYERS, CO)
     res = {}
@@ -1068,7 +1086,7 @@ def feature_splitting():
     sk, pk = res["small"]["kstar"], res["primary"]["kstar"]
     res["splitting"] = bool(sk is not None and (pk is None or sk < pk))
     print(f"  feature-splitting (smaller dict concentrates the effect into fewer features): {res['splitting']}")
-    _save("split", res); return res
+    _save_sig("split", res); return res
 print("Feature-splitting check..." + MOCK_TAG); SPLIT = feature_splitting()
 """)
 
@@ -1076,7 +1094,7 @@ print("Feature-splitting check..." + MOCK_TAG); SPLIT = feature_splitting()
 md("## 14. Change-detection vs periodicity: the attention-asymmetry test (frozen attention freezes the QK crux)")
 code(r"""
 def asymmetry():
-    ck = _load("asym")
+    ck = _load_sig("asym")
     if ck is not None: print("  [ckpt] asymmetry resumed"); return ck
     rngm = np.random.default_rng(CONFIG["SEED0"] + 91); mctx, mtg, mmeta = make_motif_battery(rngm, max(CONFIG["ATTR_PAIRS"], CONFIG["N_PAIRS"]))
     tcs_m, recon_m, _nf = train_band_transcoders(mctx, mctx, mctx, mctx, CONFIG["TC_DICT_MULT"], 2000)   # transcoders on motif activations
@@ -1092,7 +1110,7 @@ def asymmetry():
     note = ("periodicity more feature-mediated (higher clean-weighted replacement) supports an attention/QK crux for change-detection (Phase 4)."
             if asym["replacement_gap"] > 0.05 else "change and periodicity comparably feature-mediated here; the QK-crux reading is NOT supported by this run.")
     print("  reading: " + note)
-    _save("asym", asym); return asym
+    _save_sig("asym", asym); return asym
 print("Change-detection vs periodicity asymmetry..." + MOCK_TAG); ASYM = asymmetry()
 """)
 
