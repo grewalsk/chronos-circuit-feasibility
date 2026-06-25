@@ -1602,12 +1602,29 @@ print("wrote", p, "->", SUMMARY["verdict"][:72], MOCK_TAG)
 """)
 
 # ---- assemble -----------------------------------------------------------------------------------
+_META = {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+         "language_info": {"name": "python"}, "colab": {"provenance": []}, "accelerator": "GPU"}
 nb = new_notebook()
 nb.cells = [new_markdown_cell(s) if t == "md" else new_code_cell(s) for (t, s) in CELLS]
-nb.metadata = {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-               "language_info": {"name": "python"}, "colab": {"provenance": []}, "accelerator": "GPU"}
+nb.metadata = _META
 with open("phase5_v4b.ipynb", "w") as f: nbf.write(nb, f)
 with open("_mirror_phase5_v4b.py", "w") as f:
     f.write("\n".join(["# auto-mirror of phase5_v4b.ipynb code cells (local smoke test)"] +
                       ["\n# " + "=" * 60 + "\n" + s for t, s in CELLS if t == "code"]))
-print(f"wrote phase5_v4b.ipynb ({sum(t=='code' for t,_ in CELLS)} code cells) + _mirror_phase5_v4b.py")
+# ---- fast-default variant: identical cells, but MODE defaults to pilot_a100_fast so Run All on a GPU runtime needs NO config edit
+_FAST_BANNER = ("> **FAST VARIANT.** This notebook defaults `MODE` to `pilot_a100_fast` (the full Chronos-T5-Large pipeline at "
+                "~2.5-4x speed: coarser CIs/nulls + a bigger forecast batch, with the verdict logic, the all-k faithfulness curves, "
+                "and the QK power floor of 30 pairs x 5 seeds unchanged). Open on an A100/H100 GPU runtime and Run All. For the full-"
+                "resolution run use `phase5_v4b.ipynb`; to override here set `os.environ['CHRONOS_P5V4B_MODE']` before the config cell.\n\n")
+fast_cells, _flipped, _bannered = [], False, False
+for t, s in CELLS:
+    if t == "md" and not _bannered: s = _FAST_BANNER + s; _bannered = True            # banner on the title cell
+    if t == "code" and "CONFIG = {" in s and '"MODE": "mock_cpu",' in s:
+        s = s.replace('"MODE": "mock_cpu",', '"MODE": "pilot_a100_fast",', 1); _flipped = True   # flip the default mode
+    fast_cells.append((t, s))
+assert _flipped, "fast variant: did not find the MODE default to flip"
+nb_fast = new_notebook()
+nb_fast.cells = [new_markdown_cell(s) if t == "md" else new_code_cell(s) for (t, s) in fast_cells]
+nb_fast.metadata = _META
+with open("phase5_v4b_fast.ipynb", "w") as f: nbf.write(nb_fast, f)
+print(f"wrote phase5_v4b.ipynb ({sum(t=='code' for t,_ in CELLS)} code cells) + _mirror_phase5_v4b.py + phase5_v4b_fast.ipynb (MODE=pilot_a100_fast)")
