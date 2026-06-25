@@ -4,7 +4,7 @@
 import os
 CONFIG = {
     "MODE": "mock_cpu",                  # -> "pilot_a100" (Chronos-T5-Large on a high-RAM A100)
-    "MODEL_BY_MODE": {"mock_cpu": None, "pilot_t4": "amazon/chronos-t5-tiny", "pilot_a100": "amazon/chronos-t5-large"},   # pilot_t4 validates real-model autograd/device paths on tiny (override with CHRONOS_P5V4B_MODEL=amazon/chronos-t5-base for a larger check)
+    "MODEL_BY_MODE": {"mock_cpu": None, "pilot_t4": "amazon/chronos-t5-tiny", "pilot_a100": "amazon/chronos-t5-large", "pilot_a100_fast": "amazon/chronos-t5-large"},   # pilot_t4 validates real-model paths on tiny; pilot_a100_fast = the full Large pipeline at ~2.5-4x speed (coarser CIs/nulls, same verdict logic + full QK power)
     "USE_DRIVE": True,
     "SEED0": 0, "PERIODS": [8, 12, 16, 24],
     "N_PAIRS": 32, "CTX": 256, "PRED": 64, "OBS_NOISE": 0.30, "TAU_FRAC_CTX": 0.65,
@@ -58,12 +58,24 @@ CONFIG = {
         "RERANK_POOL": 48, "RERANK_PAIRS": 6,
         "PATTERN_PAIRS": 12, "PATTERN_SEEDS": 3, "PATTERN_SAMPLES": 12, "PATTERN_PERM": 300,
     },
+    # ---- pilot_a100_fast: the FULL Large pipeline, ~2.5-4x faster (coarser CIs/nulls + bigger forecast batch) ----
+    # Keeps the verdict logic, the all-k faithfulness curves, and the FULL QK power floor (PATTERN_PAIRS=30, SEEDS=5);
+    # trims only statistical resolution (random-null count, bootstrap reps, graph rebuilds, rerank pool, CRPS samples).
+    # FORECAST_BATCH=16 exploits the 80GB on an A100-80GB/H100 (push to 32 if memory allows; the OOM-retry halves it if not).
+    "pilot_a100_fast": {
+        "N_CRPS_SAMPLES": 24, "N_BOOTSTRAP": 400, "FORECAST_BATCH": 16,
+        "GRAPH_REBUILDS": 2, "GRAPH_BOOTSTRAP": 100,
+        "N_RANDOM_NULL": 10,                 # the dominant per-k curve cost (run for BOTH the gold and metric orders)
+        "RERANK_POOL": 128, "RERANK_PAIRS": 8,
+        "PATTERN_SAMPLES": 12, "PATTERN_PERM": 500,   # PATTERN_PAIRS=30 and PATTERN_SEEDS=5 stay at the panel power floor
+    },
 }
 MODE = os.environ.get("CHRONOS_P5V4B_MODE", CONFIG["MODE"])
-assert MODE in ("mock_cpu", "pilot_t4", "pilot_a100"), MODE
+assert MODE in ("mock_cpu", "pilot_t4", "pilot_a100", "pilot_a100_fast"), MODE
 CONFIG["model_id"] = os.environ.get("CHRONOS_P5V4B_MODEL", CONFIG["MODEL_BY_MODE"][MODE])
 if MODE == "mock_cpu": CONFIG.update(CONFIG["mock_cpu"])
 elif MODE == "pilot_t4": CONFIG.update(CONFIG["pilot_t4"])
+elif MODE == "pilot_a100_fast": CONFIG.update(CONFIG["pilot_a100_fast"])
 IS_MOCK = (MODE == "mock_cpu")
 IS_LARGE = (CONFIG["model_id"] is not None and "large" in CONFIG["model_id"])
 MOCK_TAG = "  [MOCK_CPU, NOT INTERPRETABLE]" if IS_MOCK else ""
